@@ -1,97 +1,89 @@
-import os
-import time
-import json
-import requests
+import os, time, json, requests
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
 from linebot import LineBotApi
 from linebot.models import TextSendMessage
+from datetime import datetime
 
-# 讀取 .env
-load_dotenv()
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-
+MONITOR_FILE = "monitors.json"
 USERS_FILE = "users.json"
 
-# Costco 商品網址
-PRODUCT_URL = "https://www.costco.com.tw/Digital-Mobile/Mobile-Tablets/iPhone-Mobile-Phones/Apple-iPhone-17-512GB-Black/p/158010"
+from dotenv import load_dotenv
+load_dotenv()
 
-# 每 3 分鐘檢查一次
-CHECK_INTERVAL_SECONDS = 180
+line_bot_api = LineBotApi(os.getenv("LINE_CHANNEL_ACCESS_TOKEN"))
 
+LOG_FOLDER = "logs"
+os.makedirs(LOG_FOLDER, exist_ok=True)
 
-def get_all_users():
-    """讀取 users.json，沒有則回空 list"""
-    if not os.path.exists(USERS_FILE):
+def log(msg):
+    today = datetime.now().strftime("%Y-%m-%d")
+    filename = f"{LOG_FOLDER}/{today}.log"
+    with open(filename, "a", encoding="utf-8") as f:
+        f.write(msg + "\n")
+    print(msg)
+
+def load_json(path):
+    if not os.path.exists(path):
         return []
-    return json.load(open(USERS_FILE, "r", encoding="utf-8"))
-
-
-def push_to_all_users(text: str):
-    """LINE 多人推播"""
-    users = get_all_users()
-    print(f"📨 正在推播給 {len(users)} 個使用者")
-
-    for uid in users:
-        try:
-            line_bot_api.push_message(uid, TextSendMessage(text=text))
-        except Exception as e:
-            print(f"❌ 推播給 {uid} 失敗：", e)
-
-
-def save_status(in_stock: bool):
-    data = {
-        "in_stock": in_stock,
-        "last_update": time.strftime("%Y-%m-%d %H:%M:%S")
-    }
-    json.dump(data, open("status.json", "w", encoding="utf-8"), indent=2, ensure_ascii=False)
-
-
-def is_in_stock() -> bool:
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-            " AppleWebKit/537.36 (KHTML, like Gecko)"
-            " Chrome/120.0.0.0 Safari/537.36"
-        )
-    }
-
     try:
-        resp = requests.get(PRODUCT_URL, headers=headers, timeout=10)
+        return json.load(open(path, "r", encoding="utf-8"))
+    except:
+        return []
+
+def is_in_stock(url):
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
         resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        return "缺貨" not in soup.get_text()
     except Exception as e:
-        print("⚠️ 網路錯誤:", e)
+        log(f"⚠️ {url} 網路錯誤: {e}")
         return False
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    return "缺貨" not in soup.get_text()
-
+def push_all(text):
+    users = load_json(USERS_FILE)
+    for u in users:
+        try:
+            line_bot_api.push_message(u, TextSendMessage(text=text))
+        except Exception as e:
+            log(f"❌ 推播給 {u} 失敗：{e}")
 
 def main():
-    push_to_all_users("🔍 Costco 商品監控啟動")
-    print("🔍 Costco 商品監控啟動")
 
-    last_in_stock = None
+    log("📡 監控程式啟動")
+
+    last_check = {}  # 每個 URL 的上次檢查時間（紀錄格式： { url: timestamp }）
 
     while True:
-        try:
-            in_stock = is_in_stock()
-            save_status(in_stock)
+        monitors = load_json(MONITOR_FILE)
 
-            print(time.strftime("[%Y-%m-%d %H:%M:%S]"),
-                  "✅ 有貨" if in_stock else "❌ 缺貨")
+        for m in monitors:
+            url = m["url"]
+            interval = m["interval"]
 
-            if last_in_stock is False and in_stock is True:
-                push_to_all_users(f"📦 Costco 補貨啦！快去搶🔥\n{PRODUCT_URL}")
+            # 是否到了該檢查的時間
+            if url not in last_check or time.time() - last_check[url] >= interval:
 
-            last_in_stock = in_stock
+                in_stock = is_in_stock(url)
 
-        except Exception as e:
-            print("⚠️ 發生錯誤：", e)
+                log(f"[{datetime.now().strftime('%H:%M:%S')}] {url} → {'有貨' if in_stock else '缺貨'}")
 
-        time.sleep(CHECK_INTERVAL_SECONDS)
+                # 補貨通知（缺 → 有）
+                if m["last_in_stock"] is False and in_stock is True:
+                    push_all(f"📦 補貨啦！\n{url}")
+
+                # 更新狀態
+                m["last_in_stock"] = in_stock
+
+                last_check[url] = time.time()
+
+        # 儲存更新後的監控清單
+        json.dump(monitors, open(MONITOR_FILE, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+
+        time.sleep(1)
 
 
 if __name__ == "__main__":
