@@ -1,3 +1,5 @@
 logs/
 logs/*
 *.log
+users.json
+monitors.json
