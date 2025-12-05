@@ -131,14 +131,20 @@ def get_product_name(url: str) -> str:
 
 def check_stock_once(url: str) -> bool:
     """立刻請求網站檢查是否有貨"""
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=10)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        return "缺貨" not in soup.get_text()
-    except Exception as e:
-        print(f"⚠️ 檢查庫存失敗：{url} -> {e}")
+    resp = requests.get(url, headers=HEADERS, timeout=10)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # 1. 有加購按鈕 → 必定有貨
+    if soup.select_one("#add-to-cart-button"):
+        return True
+
+    # 2. 找缺貨提示
+    if "缺貨" in soup.get_text():
         return False
+
+    # 3. 無按鈕且無缺貨 → 商品下架或 API 無資料（當成缺貨）
+    return False
 
 
 # ------------------------------------------------------

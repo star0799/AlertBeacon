@@ -3,3 +3,4 @@ logs/*
 *.log
 users.json
 monitors.json
+start_all.bat

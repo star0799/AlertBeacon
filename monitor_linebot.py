@@ -80,16 +80,21 @@ HEADERS = {
     )
 }
 
+def is_in_stock(url):
+    resp = requests.get(url, headers=HEADERS, timeout=10)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
 
-def is_in_stock(url: str) -> bool:
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=10)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        return "缺貨" not in soup.get_text()
-    except Exception as e:
-        log(f"⚠️ {url} 網路錯誤: {e}")
+    # 1. 有加購按鈕 → 必定有貨
+    if soup.select_one("#add-to-cart-button"):
+        return True
+
+    # 2. 找缺貨提示
+    if "缺貨" in soup.get_text():
         return False
+
+    # 3. 無按鈕且無缺貨 → 商品下架或 API 無資料（當成缺貨）
+    return False
 
 
 def push_all(text: str):
