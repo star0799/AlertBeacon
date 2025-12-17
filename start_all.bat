@@ -1,16 +1,25 @@
 @echo off
-rem ==== 1. 切到專案資料夾（用批次檔所在路徑）====
+chcp 65001 >nul
 cd /d "%~dp0"
 
-rem ==== 2. 啟動虛擬環境 ====
-call .venv\Scripts\activate.bat
+set PY="%~dp0.venv\Scripts\python.exe"
+if not exist %PY% (
+  echo [ERROR] 找不到 venv python: %PY%
+  pause
+  exit /b 1
+)
 
-rem ==== 3. 開三個獨立視窗執行 ====
-start "LINE Bot Server" python bot_server.py
-start "Stock Monitor" python monitor_linebot.py
-start "ngrok" ngrok http 5000
+set NGROK="%~dp0ngrok.exe"
+if not exist %NGROK% (
+  echo [ERROR] 找不到 ngrok.exe: %NGROK%
+  pause
+  exit /b 1
+)
+
+start "LINE Bot Server" %PY% bot_server.py
+start "Stock Monitor" %PY% monitor_linebot.py
+start "ngrok" %NGROK% http 5000
 
 echo.
 echo 已啟動：bot_server + monitor_linebot + ngrok
-echo 關閉時，請手動關掉各視窗即可結束服務。
 pause
