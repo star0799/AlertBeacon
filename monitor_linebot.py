@@ -37,11 +37,12 @@ line_bot_api = LineBotApi(LINE_TOKEN)
 # 日誌
 # ------------------------------------------------------
 def log(msg: str):
-    today = datetime.now().strftime("%Y-%m-%d")
-    filename = os.path.join(LOG_FOLDER, f"{today}.log")
+    os.makedirs("logs", exist_ok=True)  # 確保 logs 資料夾存在
+
+    filename = os.path.join("logs", f"{datetime.now():%Y-%m-%d}.log")
+    print(msg)
     with open(filename, "a", encoding="utf-8") as f:
         f.write(msg + "\n")
-    print(msg)
 
 # ------------------------------------------------------
 # JSON 工具
@@ -233,4 +234,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-# GPT DIFF
