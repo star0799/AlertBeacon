@@ -6,3 +6,4 @@ monitors.json
 ngrok.exe
 ngrok
 *.exe
+.env
