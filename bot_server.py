@@ -130,20 +130,40 @@ def get_product_name(url: str) -> str:
 
 
 def check_stock_once(url: str) -> bool:
-    """立刻請求網站檢查是否有貨"""
-    resp = requests.get(url, headers=HEADERS, timeout=10)
+    """立刻請求網站檢查是否有貨（盡量避免誤判）"""
+    resp = requests.get(url, headers=HEADERS, timeout=(5, 20))
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # 1. 有加購按鈕 → 必定有貨
-    if soup.select_one("#add-to-cart-button"):
-        return True
-
-    # 2. 找缺貨提示
-    if "缺貨" in soup.get_text():
+    def is_disabled(btn) -> bool:
+        if btn is None:
+            return True
+        if btn.has_attr("disabled"):
+            return True
+        if (btn.get("aria-disabled") or "").lower() == "true":
+            return True
         return False
 
-    # 3. 無按鈕且無缺貨 → 商品下架或 API 無資料（當成缺貨）
+    # 1) 優先判斷：id=add-to-cart-button（你新貼的「有貨」HTML就是這顆）
+    cart_btn = soup.select_one("#add-to-cart-button")
+    if cart_btn:
+        txt = cart_btn.get_text(strip=True)
+        if ("加入購物車" in txt) and (not is_disabled(cart_btn)):
+            return True
+        return False  # 有按鈕但 disabled 或文字不是加入購物車 → 當缺貨
+
+    # 2) 次要判斷：找主要按鈕文字包含「加入購物車」的（對應你貼過的另一種版型）
+    for b in soup.select("button"):
+        txt = b.get_text(strip=True)
+        if "加入購物車" in txt:
+            return not is_disabled(b)
+
+    # 3) 保險：頁面文字包含「缺貨」→ 缺貨
+    page_text = soup.get_text(" ", strip=True)
+    if "缺貨" in page_text:
+        return False
+
+    # 4) 其他未知狀況（通常是缺貨/頁面結構變了）
     return False
 
 
