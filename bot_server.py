@@ -4,6 +4,7 @@ from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 import os
+import sys
 import json
 import re
 import time
@@ -16,11 +17,21 @@ from filelock import FileLock
 load_dotenv()
 app = Flask(__name__)
 
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+COSTCO_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_COSTCO_CHANNEL_ACCESS_TOKEN")
+COSTCO_CHANNEL_SECRET = os.getenv("LINE_COSTCO_CHANNEL_SECRET")
 
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
+costco_line_bot_api = LineBotApi(COSTCO_CHANNEL_ACCESS_TOKEN)
+costco_handler = WebhookHandler(COSTCO_CHANNEL_SECRET)
+
+# Cruise
+CRUISE_TOKEN = os.getenv("LINE_CRUISE_CHANNEL_ACCESS_TOKEN")
+CRUISE_SECRET = os.getenv("LINE_CRUISE_CHANNEL_SECRET")
+if not CRUISE_TOKEN or not CRUISE_SECRET:
+    print("Cruise LINE channel token/secret 缺失，請檢查 .env 設定")
+    sys.exit(1)
+
+cruise_line_bot_api = LineBotApi(CRUISE_TOKEN)
+cruise_handler = WebhookHandler(CRUISE_SECRET)
 
 USERS_FILE = "users.json"
 MONITORS_FILE = "monitors.json"
@@ -170,8 +181,9 @@ def check_stock_once(url: str) -> bool:
 # ------------------------------------------------------
 # Webhook
 # ------------------------------------------------------
-@app.route("/callback", methods=["POST"])
-def callback():
+
+
+def _handle_callback(handler):
     signature = request.headers["X-Line-Signature"]
     body = request.get_data(as_text=True)
 
@@ -183,11 +195,21 @@ def callback():
     return "OK"
 
 
+@app.route("/callback/costco", methods=["POST"])
+def callback_costco():
+    return _handle_callback(costco_handler)
+
+
+@app.route("/callback/cruise", methods=["POST"])
+def callback_cruise():
+    return _handle_callback(cruise_handler)
+
+
 # ------------------------------------------------------
 # 處理訊息
 # ------------------------------------------------------
-@handler.add(MessageEvent, message=TextMessage)
-def handle_message(event):
+@costco_handler.add(MessageEvent, message=TextMessage)
+def handle_costco_message(event):
 
     user_id = event.source.user_id
     add_user(user_id)
@@ -243,7 +265,7 @@ def handle_message(event):
             update_monitors(mut)
             reply = "\n".join(lines)
 
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        costco_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
 
     # ==================================================
@@ -253,7 +275,7 @@ def handle_message(event):
     if cmd in ("新增", "add"):
         if len(parts) < 2:
             reply = "格式：\n\n新增 URL [秒數]\nadd URL [秒數]\n\n秒數省略則預設 180 秒。"
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            costco_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
             return
 
         url = parts[1]
@@ -301,7 +323,7 @@ def handle_message(event):
         else:
             reply = "⚠️ 新增監控時發生未知錯誤（理論上不會到這裡）。"
 
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        costco_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
 
     # ==================================================
@@ -310,7 +332,7 @@ def handle_message(event):
     if cmd in ("移除", "刪除", "remove", "del"):
         if len(parts) < 2:
             reply = "格式：\n\n移除 URL\nremove URL"
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            costco_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
             return
 
         url = parts[1]
@@ -329,7 +351,7 @@ def handle_message(event):
         else:
             reply = "找不到這個 URL 的監控。"
 
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        costco_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
 
     # ==================================================
@@ -370,7 +392,7 @@ def handle_message(event):
 
             reply = "\n".join(msg_lines)
 
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        costco_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
 
     # ==================================================
@@ -384,7 +406,12 @@ def handle_message(event):
         "➖ 移除 [URL] / remove [URL]"
     )
 
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=help_text))
+    costco_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=help_text))
+
+
+@cruise_handler.add(MessageEvent, message=TextMessage)
+def handle_cruise_message(event):
+    cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text="cruise ok"))
 
 
 # ------------------------------------------------------

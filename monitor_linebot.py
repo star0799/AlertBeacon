@@ -28,9 +28,9 @@ HEADERS = {
 # 初始化 LINE
 # ------------------------------------------------------
 load_dotenv()
-LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_TOKEN = os.getenv("LINE_COSTCO_CHANNEL_ACCESS_TOKEN")
 if not LINE_TOKEN:
-    raise RuntimeError("Missing LINE_CHANNEL_ACCESS_TOKEN in .env")
+    raise RuntimeError("Missing LINE_COSTCO_CHANNEL_ACCESS_TOKEN in .env")
 line_bot_api = LineBotApi(LINE_TOKEN)
 
 # ------------------------------------------------------
