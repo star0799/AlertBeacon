@@ -7,3 +7,10 @@ ngrok.exe
 ngrok
 *.exe
 .env
+# --- SDC / Cruise local secrets & runtime state ---
+latest_tokens.json
+state/
+*.lock
+state/
+.vscode
+users_cruise.json

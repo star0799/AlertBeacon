@@ -2,6 +2,7 @@ from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from flask import Flask, request, jsonify
 
 import os
 import sys
@@ -15,8 +16,13 @@ from dotenv import load_dotenv
 from filelock import FileLock
 
 load_dotenv()
-app = Flask(__name__)
 
+app = Flask(__name__)
+@app.get("/_routes")
+def list_routes():
+    return jsonify(sorted([str(r) for r in app.url_map.iter_rules()]))
+
+print("[BOOT] bot_server file =", __file__, flush=True)
 COSTCO_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_COSTCO_CHANNEL_ACCESS_TOKEN")
 COSTCO_CHANNEL_SECRET = os.getenv("LINE_COSTCO_CHANNEL_SECRET")
 
@@ -26,17 +32,124 @@ costco_handler = WebhookHandler(COSTCO_CHANNEL_SECRET)
 # Cruise
 CRUISE_TOKEN = os.getenv("LINE_CRUISE_CHANNEL_ACCESS_TOKEN")
 CRUISE_SECRET = os.getenv("LINE_CRUISE_CHANNEL_SECRET")
-if not CRUISE_TOKEN or not CRUISE_SECRET:
-    print("Cruise LINE channel token/secret 缺失，請檢查 .env 設定")
-    sys.exit(1)
 
 cruise_line_bot_api = LineBotApi(CRUISE_TOKEN)
 cruise_handler = WebhookHandler(CRUISE_SECRET)
 
 USERS_FILE = "users.json"
+USERS_CRUISE_FILE = "users_cruise.json"
 MONITORS_FILE = "monitors.json"
+TOKENS_CACHE_FILE = "latest_tokens.json"
+
+_latest_recaptcha = {"token": None, "at": None, "action": None}
+_latest_tokens = {"accessToken": None, "refreshToken": None, "user": None, "at": None}
+
+@app.post("/cruise/tokens")
+def cruise_tokens():
+    data = request.get_json(force=True, silent=True) or {}
+    if not data.get("accessToken") or not data.get("refreshToken"):
+        return jsonify({"ok": False, "error": "missing tokens"}), 400
+    _latest_tokens.update({
+        "accessToken": data["accessToken"],
+        "refreshToken": data["refreshToken"],
+        "user": data.get("user"),
+        "at": data.get("at"),
+    })
+    write_json(TOKENS_CACHE_FILE, _latest_tokens)
+    print("[CRUISE] tokens updated", _latest_tokens["at"])
+    return jsonify({"ok": True})
+
+@app.get("/cruise/tokens")
+def cruise_tokens_get():
+    return jsonify(_latest_tokens)
+
+@app.post("/cruise/notify")
+def cruise_notify():
+    data = request.get_json(force=True, silent=True) or {}
+    print("[CRUISE NOTIFY]", json.dumps(data, ensure_ascii=False))
+
+    users = read_json(USERS_CRUISE_FILE, [])
+    if not users:
+        return jsonify({"ok": False, "error": "no cruise users yet"}), 400
+
+    t = data.get("type", "CRUISE")
+
+    if t == "CRUISE_CABIN_AVAILABLE":
+        total = data.get("totalItems")
+        cabins = data.get("cabins") or []
+        text = f"🚢 有房通知！totalItems={total}\n" + "\n".join(cabins[:10])
+
+    elif t == "CRUISE_NEED_RELOGIN":
+        # daemon 偵測到 refresh / cabin 401/403 時會送這個
+        err = data.get("error") or ""
+        text = (
+            "⚠️ Cruise 需要重新登入一次（token 失效/未授權）\n"
+            "請開啟 SDC 登入頁手動登入，Token Sync 會自動回灌 tokens。\n"
+            f"{err}"
+        )
+
+    else:
+        # 其他事件先直接丟 type + error/message
+        msg = data.get("message") or data.get("error") or ""
+        text = f"⚠️ Cruise {t}\n{msg}"
+    msg_obj = TextSendMessage(text=text)
+
+    ok_count = 0
+    errors = []
+    for uid in users:
+        try:
+            cruise_line_bot_api.push_message(uid, msg_obj)
+            ok_count += 1
+        except Exception as e:
+            errors.append({"user": uid, "error": str(e)})
+
+    return jsonify({"ok": True, "sent": ok_count, "errors": errors})
+
+@app.post("/cruise/test_push")
+def cruise_test_push():
+    users = read_json(USERS_CRUISE_FILE, [])
+    if not users:
+        return jsonify({"ok": False, "error": "no cruise users yet. Please message cruise bot once."}), 400
+
+    text = (request.get_json(silent=True) or {}).get("text") or "✅ Cruise 測試推播成功"
+    msg = TextSendMessage(text=text)
+
+    ok_count = 0
+    errors = []
+
+    for uid in users:
+        try:
+            cruise_line_bot_api.push_message(uid, msg)
+            ok_count += 1
+        except Exception as e:
+            errors.append({"user": uid, "error": str(e)})
+
+    return jsonify({"ok": True, "sent": ok_count, "errors": errors})
 
 
+@app.post("/cruise/recaptcha")
+def cruise_recaptcha():
+    data = request.get_json(force=True, silent=True) or {}
+    token = data.get("recaptcha_token")
+    if not token:
+        return jsonify({"ok": False, "error": "missing recaptcha_token"}), 400
+
+    _latest_recaptcha["token"] = token
+    _latest_recaptcha["at"] = time.time()
+    _latest_recaptcha["action"] = data.get("action")
+
+    print("[CRUISE] recaptcha updated", _latest_recaptcha["action"])
+    return jsonify({"ok": True})
+
+@app.get("/cruise/recaptcha")
+def cruise_recaptcha_get():
+    return jsonify(_latest_recaptcha)
+
+@app.post("/cruise/tokens/clear")
+def cruise_tokens_clear():
+    _latest_tokens.update({"accessToken": None, "refreshToken": None, "user": None, "at": None})
+    write_json(TOKENS_CACHE_FILE, _latest_tokens)  # 若你做了持久化
+    return jsonify({"ok": True})
 # ------------------------------------------------------
 # 基本 JSON 工具（不加鎖的版本）
 # ------------------------------------------------------
@@ -63,7 +176,9 @@ def write_json(path: str, data):
     except Exception as e:
         print(f"⚠️ 寫入 {path} 失敗：{e}")
 
-
+#
+_latest_tokens.update(read_json(TOKENS_CACHE_FILE, _latest_tokens))
+#
 # ------------------------------------------------------
 # monitors.json 專用：一次 read-modify-write（有檔案鎖）
 # ------------------------------------------------------
@@ -107,6 +222,15 @@ def add_user(user_id: str):
         users.append(user_id)
         write_json(USERS_FILE, users)
         print("⭐ 新增使用者:", user_id)
+
+
+
+def add_cruise_user(user_id: str):
+    users = read_json(USERS_CRUISE_FILE, [])
+    if user_id not in users:
+        users.append(user_id)
+        write_json(USERS_CRUISE_FILE, users)
+        print("⭐ 新增 Cruise 使用者:", user_id)
 
 
 # ------------------------------------------------------
@@ -411,6 +535,8 @@ def handle_costco_message(event):
 
 @cruise_handler.add(MessageEvent, message=TextMessage)
 def handle_cruise_message(event):
+    user_id = event.source.user_id
+    add_cruise_user(user_id)
     cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text="cruise ok"))
 
 
