@@ -22,7 +22,10 @@ app = Flask(__name__)
 def list_routes():
     return jsonify(sorted([str(r) for r in app.url_map.iter_rules()]))
 
-print("[BOOT] bot_server file =", __file__, flush=True)
+def ts() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+print(f"[{ts()}] [BOOT] bot_server file={__file__}", flush=True)
 COSTCO_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_COSTCO_CHANNEL_ACCESS_TOKEN")
 COSTCO_CHANNEL_SECRET = os.getenv("LINE_COSTCO_CHANNEL_SECRET")
 
@@ -56,7 +59,7 @@ def cruise_tokens():
         "at": data.get("at"),
     })
     write_json(TOKENS_CACHE_FILE, _latest_tokens)
-    print("[CRUISE] tokens updated", _latest_tokens["at"])
+    print(f"[{ts()}] [CRUISE] tokens updated", _latest_tokens["at"])
     return jsonify({"ok": True})
 
 @app.get("/cruise/tokens")
@@ -66,7 +69,7 @@ def cruise_tokens_get():
 @app.post("/cruise/notify")
 def cruise_notify():
     data = request.get_json(force=True, silent=True) or {}
-    print("[CRUISE NOTIFY]", json.dumps(data, ensure_ascii=False))
+    print(f"[{ts()}] [CRUISE NOTIFY]", json.dumps(data, ensure_ascii=False))
 
     users = read_json(USERS_CRUISE_FILE, [])
     if not users:
@@ -138,7 +141,7 @@ def cruise_recaptcha():
     _latest_recaptcha["at"] = time.time()
     _latest_recaptcha["action"] = data.get("action")
 
-    print("[CRUISE] recaptcha updated", _latest_recaptcha["action"])
+    print(f"[{ts()}] [CRUISE] recaptcha updated", _latest_recaptcha["action"])
     return jsonify({"ok": True})
 
 @app.get("/cruise/recaptcha")
@@ -163,7 +166,7 @@ def read_json(path: str, default):
             return default
         return json.loads(content)
     except Exception as e:
-        print(f"⚠️ 讀取 {path} 失敗：{e}")
+        print(f"[{ts()}] ⚠️ 讀取 {path} 失敗：{e}")
         return default
 
 
@@ -174,7 +177,7 @@ def write_json(path: str, data):
             json.dump(data, f, indent=2, ensure_ascii=False)
         os.replace(tmp_path, path)
     except Exception as e:
-        print(f"⚠️ 寫入 {path} 失敗：{e}")
+        print(f"[{ts()}] ⚠️ 寫入 {path} 失敗：{e}")
 
 #
 _latest_tokens.update(read_json(TOKENS_CACHE_FILE, _latest_tokens))
@@ -221,7 +224,7 @@ def add_user(user_id: str):
     if user_id not in users:
         users.append(user_id)
         write_json(USERS_FILE, users)
-        print("⭐ 新增使用者:", user_id)
+        print(f"[{ts()}] ⭐ 新增使用者:", user_id)
 
 
 
@@ -230,7 +233,7 @@ def add_cruise_user(user_id: str):
     if user_id not in users:
         users.append(user_id)
         write_json(USERS_CRUISE_FILE, users)
-        print("⭐ 新增 Cruise 使用者:", user_id)
+        print(f"[{ts()}] ⭐ 新增 Cruise 使用者:", user_id)
 
 
 # ------------------------------------------------------
@@ -259,7 +262,7 @@ def get_product_name(url: str) -> str:
         if title:
             return title.text.strip()
     except Exception as e:
-        print(f"⚠️ 取得商品名稱失敗：{url} -> {e}")
+        print(f"[{ts()}] ⚠️ 取得商品名稱失敗：{url} -> {e}")
 
     return "未命名商品"
 

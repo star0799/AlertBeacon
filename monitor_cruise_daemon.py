@@ -6,6 +6,8 @@ BASE = "https://backend-prd.b2m.stardreamcruises.com"
 BOT = "http://127.0.0.1:5000"
 POLL_SECONDS = 30
 
+def ts() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
 
 def notify(payload: dict) -> None:
     r = requests.post(f"{BOT}/cruise/notify", json=payload, timeout=10)
@@ -23,7 +25,7 @@ def get_tokens() -> dict | None:
         r.raise_for_status()
         data = r.json() or {}
     except Exception as e:
-        print("[DAEMON] warn: failed to GET /cruise/tokens:", repr(e), flush=True)
+        print(f"[{ts()}] [DAEMON] warn: failed to GET /cruise/tokens:", repr(e), flush=True)
         return None
 
     access = data.get("accessToken")
@@ -80,8 +82,8 @@ def main():
         "page": "1",
     }
 
-    print("[DAEMON] started. polling every", POLL_SECONDS, "seconds", flush=True)
-    print("[DAEMON] params =", params, flush=True)
+    print(f"[{ts()}] [DAEMON] started. polling every {POLL_SECONDS} seconds", flush=True)
+    print(f"[{ts()}] [DAEMON] params={params}", flush=True)
 
     last_had = None
     last_alert_at = 0.0
@@ -90,7 +92,7 @@ def main():
         try:
             tokens = get_tokens()
             if not tokens:
-                print("[DAEMON] waiting for tokens... (please login once)", flush=True)
+                print(f"[{ts()}] [DAEMON] waiting for tokens... (please login once)", flush=True)
                 time.sleep(30)
                 continue
             access = tokens["accessToken"]
@@ -115,7 +117,7 @@ def main():
                     try:
                         requests.post(f"{BOT}/cruise/tokens", json=payload, timeout=5)
                     except Exception as ex:
-                        print("[DAEMON] warn: failed to POST /cruise/tokens:", repr(ex), flush=True)
+                        print(f"[{ts()}] [DAEMON] warn: failed to POST /cruise/tokens:", repr(ex), flush=True)
 
                     access = payload["accessToken"]
                     refresh_token = payload["refreshToken"]
@@ -124,7 +126,7 @@ def main():
 
             total = data.get("meta", {}).get("totalItems", 0)
             now_had = total > 0
-            print(f"[DAEMON] cabin totalItems={total} had={now_had}", flush=True)
+            print(f"[{ts()}] [DAEMON] cabin totalItems={total} had={now_had}", flush=True)
 
             if last_had is False and now_had is True:
                 cabins = [
@@ -143,7 +145,7 @@ def main():
             time.sleep(POLL_SECONDS)
 
         except Exception as e:
-            print("[DAEMON] error:", repr(e), flush=True)
+            print(f"[{ts()}] [DAEMON] error:", repr(e), flush=True)
             now = time.time()
 
             # refresh/cabin 被 401/403 -> 通知你要手動登入一次
@@ -157,15 +159,15 @@ def main():
                             "error": str(e),
                         })
                     except Exception as ex:
-                        print("[DAEMON] notify failed:", repr(ex), flush=True)
+                        print(f"[{ts()}] [DAEMON] notify failed:", repr(ex), flush=True)
                     last_alert_at = now
 
                 # ✅ 這裡：清空 bot_server tokens，避免一直拿壞 token 重試
                 try:
                     requests.post(f"{BOT}/cruise/tokens/clear", timeout=5)
-                    print("[DAEMON] tokens cleared on bot_server", flush=True)
+                    print(f"[{ts()}] [DAEMON] tokens cleared on bot_server", flush=True)
                 except Exception as ex:
-                    print("[DAEMON] warn: failed to clear tokens:", repr(ex), flush=True)
+                    print(f"[{ts()}] [DAEMON] warn: failed to clear tokens:", repr(ex), flush=True)
 
                 time.sleep(60)  # 建議 60 秒，減少洗版
                 continue
@@ -180,7 +182,7 @@ def main():
                         "error": str(e),
                     })
                 except Exception as ex:
-                    print("[DAEMON] notify failed:", repr(ex), flush=True)
+                    print(f"[{ts()}] [DAEMON] notify failed:", repr(ex), flush=True)
                 last_alert_at = now
 
             time.sleep(10)
