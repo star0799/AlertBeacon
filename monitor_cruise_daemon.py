@@ -1,13 +1,22 @@
+import json
+import os
 import time
 import requests
 from dotenv import load_dotenv
+from filelock import FileLock
 
 BASE = "https://backend-prd.b2m.stardreamcruises.com"
 BOT = "http://127.0.0.1:5000"
 POLL_SECONDS = 30
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MONITORS_FILE = os.path.join(BASE_DIR, "monitors_cruise.json")
+TIER_RULES_FILE = os.path.join(BASE_DIR, "cabin_name")
+NO_ROOM_COOLDOWN_SECONDS = 300
+
 
 def ts() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
+
 
 def notify(payload: dict) -> None:
     r = requests.post(f"{BOT}/cruise/notify", json=payload, timeout=10)
@@ -15,11 +24,6 @@ def notify(payload: dict) -> None:
 
 
 def get_tokens() -> dict | None:
-    """
-    從 bot_server 取得 tokens。
-    - 有 token：回傳 dict（含 accessToken/refreshToken）
-    - 沒 token：回傳 None（不要丟例外，避免 log 洗版）
-    """
     try:
         r = requests.get(f"{BOT}/cruise/tokens", timeout=5)
         r.raise_for_status()
@@ -50,7 +54,7 @@ def refresh(refresh_token: str) -> dict:
     return r.json()
 
 
-def cabin_allotment(access_token: str, params: dict) -> dict:
+def cabin_allotment(access_token: str, params: dict) -> tuple[int, dict]:
     r = requests.get(
         f"{BASE}/customers/cabin-allotment",
         params=params,
@@ -66,27 +70,173 @@ def cabin_allotment(access_token: str, params: dict) -> dict:
     if r.status_code in (401, 403):
         raise PermissionError(f"cabin unauthorized {r.status_code}")
     r.raise_for_status()
-    return r.json()
+    return r.status_code, r.json()
+
+
+def read_json(path: str, default):
+    try:
+        if not os.path.exists(path):
+            return default
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        if not content:
+            return default
+        return json.loads(content)
+    except Exception as e:
+        print(f"[{ts()}] [DAEMON] warn: failed to read {path}:", repr(e), flush=True)
+        return default
+
+
+def write_json(path: str, data):
+    try:
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, path)
+    except Exception as e:
+        print(f"[{ts()}] [DAEMON] warn: failed to write {path}:", repr(e), flush=True)
+
+
+def read_monitors():
+    lock = FileLock(MONITORS_FILE + ".lock")
+    with lock:
+        return read_json(MONITORS_FILE, [])
+
+
+def update_monitor_fields(monitor_key: tuple, updates: dict):
+    lock = FileLock(MONITORS_FILE + ".lock")
+    with lock:
+        monitors = read_json(MONITORS_FILE, [])
+        for m in monitors:
+            if make_monitor_key(m) == monitor_key:
+                m.update(updates)
+                break
+        write_json(MONITORS_FILE, monitors)
+
+
+def load_tier_rules() -> list:
+    try:
+        with open(TIER_RULES_FILE, "r", encoding="utf-8") as f:
+            content = f.read()
+        scope: dict = {}
+        exec(content, {}, scope)
+        rules = scope.get("TIER_RULES") or []
+        normalized = []
+        for tier, keywords in rules:
+            try:
+                normalized.append((int(tier), list(keywords)))
+            except Exception:
+                continue
+        return normalized
+    except Exception as e:
+        print(f"[{ts()}] [DAEMON] warn: failed to load tier rules:", repr(e), flush=True)
+        return []
+
+
+def make_monitor_key(m: dict) -> tuple:
+    return (
+        m.get("itinerary_name"),
+        m.get("departure_date") or m.get("date"),
+        str(m.get("departure_port")),
+        m.get("lang"),
+    )
+
+
+def find_tier_for_name(cabin_name: str, tier_rules: list) -> int | None:
+    if not cabin_name:
+        return None
+    name = cabin_name.lower()
+    for tier, keywords in tier_rules:
+        for kw in keywords:
+            if kw and str(kw).lower() in name:
+                return tier
+    return None
+
+
+def to_int_or_none(value):
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def build_params(monitor: dict, pax: int) -> dict | None:
+    itinerary_name = monitor.get("itinerary_name")
+    departure_date = monitor.get("departure_date") or monitor.get("date")
+    departure_port = monitor.get("departure_port")
+    lang = monitor.get("lang")
+    if not itinerary_name or not departure_date or departure_port is None or not lang:
+        return None
+    return {
+        "itinerary_name": itinerary_name,
+        "departure_date": departure_date,
+        "departure_port": str(departure_port),
+        "pax": str(pax),
+        "lang": lang,
+    }
+
+
+def build_tier_message(monitor: dict, tier: int, cabins: list) -> str:
+    tier_text_map = {
+        3: "\u9732\u53f0",
+        2: "\u6d77\u666f",
+        1: "\u5167\u5074",
+    }
+    date = monitor.get("departure_date") or monitor.get("date") or ""
+    port_name = monitor.get("port_name") or monitor.get("departure_port") or ""
+    itinerary_name = monitor.get("itinerary_name") or ""
+    tier_text = tier_text_map.get(tier, str(tier))
+    cabin_lines = "\n".join(cabins) if cabins else ""
+    return (
+        f"{date} {port_name}\n"
+        f"{itinerary_name}\n"
+        f"{tier_text}\n"
+        f"{cabin_lines}"
+    )
+
+
+def fetch_cabins(access: str, refresh_token: str, params: dict, user: str | None):
+    try:
+        status_code, data = cabin_allotment(access, params)
+        return status_code, data, access, refresh_token
+    except PermissionError:
+        try:
+            ref = refresh(refresh_token)
+        except requests.HTTPError as ex:
+            sc = getattr(ex.response, "status_code", None)
+            if sc in (401, 403):
+                raise PermissionError(f"refresh unauthorized {sc}") from ex
+            raise
+
+        new_access = ref.get("accessToken")
+        new_refresh = ref.get("refreshToken")
+
+        if new_access or new_refresh:
+            payload = {
+                "accessToken": new_access or access,
+                "refreshToken": new_refresh or refresh_token,
+                "user": user,
+                "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+            try:
+                requests.post(f"{BOT}/cruise/tokens", json=payload, timeout=5)
+            except Exception as ex:
+                print(f"[{ts()}] [DAEMON] warn: failed to POST /cruise/tokens:", repr(ex), flush=True)
+
+            access = payload["accessToken"]
+            refresh_token = payload["refreshToken"]
+
+        status_code, data = cabin_allotment(access, params)
+        return status_code, data, access, refresh_token
 
 
 def main():
     load_dotenv()
 
-    params = {
-        "itinerary_name": "探索星號 - 2晚 - 那霸 海上遊",
-        "departure_date": "2026-02-25",
-        "departure_port": "12",
-        "pax": "4",
-        "lang": "hant",
-        "currentStep": "0",
-        "page": "1",
-    }
-
     print(f"[{ts()}] [DAEMON] started. polling every {POLL_SECONDS} seconds", flush=True)
-    print(f"[{ts()}] [DAEMON] params={params}", flush=True)
 
-    last_had = None
     last_alert_at = 0.0
+    tier_rules = load_tier_rules()
 
     while True:
         try:
@@ -97,60 +247,140 @@ def main():
                 continue
             access = tokens["accessToken"]
             refresh_token = tokens["refreshToken"]
+            user = tokens.get("user")
 
-            try:
-                data = cabin_allotment(access, params)
-            except PermissionError:
-                ref = refresh(refresh_token)
+            monitors = read_monitors()
+            for monitor in monitors:
+                if not monitor.get("enabled", False):
+                    continue
 
-                new_access = ref.get("accessToken")
-                new_refresh = ref.get("refreshToken")
+                monitor_key = make_monitor_key(monitor)
+                try:
+                    now = time.time()
+                    max_pax = to_int_or_none(monitor.get("max_pax"))
+                    no_room_until = float(monitor.get("no_room_until_epoch") or 0)
 
-                if new_access or new_refresh:
-                    payload = {
-                        "accessToken": new_access or access,
-                        "refreshToken": new_refresh or refresh_token,
-                        "user": tokens.get("user"),
-                        "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    if now < no_room_until:
+                        print(f"[{ts()}] [DAEMON] skip (no_room cooldown) key={monitor_key}", flush=True)
+                        continue
+
+                    probe_paxes = [max_pax] if max_pax is not None else [2, 4]
+                    last_http = None
+                    last_items = []
+                    observed_max_pax = 0
+                    any_items = False
+                    any_http_200 = False
+
+                    for pax in probe_paxes:
+                        params = build_params(monitor, pax)
+                        if not params:
+                            print(f"[{ts()}] [DAEMON] warn: missing required params key={monitor_key}", flush=True)
+                            break
+
+                        status_code, data, access, refresh_token = fetch_cabins(
+                            access, refresh_token, params, user
+                        )
+                        last_http = status_code
+                        if status_code == 200:
+                            any_http_200 = True
+
+                        items = data.get("items", []) or []
+                        if items:
+                            last_items = items
+                            any_items = True
+                        elif not any_items:
+                            last_items = items
+
+                        if max_pax is None and status_code == 200 and items:
+                            observed_max_pax = max(
+                                observed_max_pax,
+                                max(int(x.get("cabin_pax") or 0) for x in items),
+                            )
+
+                    if last_http is None:
+                        continue
+
+                    effective_http = 200 if any_http_200 else last_http
+                    update_fields = {
+                        "last_check_at": ts(),
+                        "last_http": effective_http,
+                        "last_seen_cabins": [x.get("cabin_name") for x in last_items if x.get("cabin_name")],
                     }
-                    # 回寫 bot_server（你已經有 POST /cruise/tokens）
-                    try:
-                        requests.post(f"{BOT}/cruise/tokens", json=payload, timeout=5)
-                    except Exception as ex:
-                        print(f"[{ts()}] [DAEMON] warn: failed to POST /cruise/tokens:", repr(ex), flush=True)
 
-                    access = payload["accessToken"]
-                    refresh_token = payload["refreshToken"]
+                    if effective_http != 200:
+                        update_monitor_fields(monitor_key, update_fields)
+                        continue
 
-                data = cabin_allotment(access, params)
+                    tiers = []
+                    cabin_tiers = {}
+                    for name in update_fields["last_seen_cabins"]:
+                        tier = find_tier_for_name(name, tier_rules)
+                        if tier is not None:
+                            tiers.append(tier)
+                            cabin_tiers.setdefault(tier, []).append(name)
 
-            total = data.get("meta", {}).get("totalItems", 0)
-            now_had = total > 0
-            print(f"[{ts()}] [DAEMON] cabin totalItems={total} had={now_had}", flush=True)
+                    update_fields["last_seen_tiers"] = sorted(set(tiers))
 
-            if last_had is False and now_had is True:
-                cabins = [
-                    (x.get("traditional_chinese_cabin_name") or x.get("cabin_name"))
-                    for x in data.get("items", [])
-                ]
-                notify({
-                    "type": "CRUISE_CABIN_AVAILABLE",
-                    "at": time.time(),
-                    "totalItems": total,
-                    "cabins": cabins,
-                    "params": params,
-                })
+                    if max_pax is None and observed_max_pax > 0:
+                        update_fields["max_pax"] = observed_max_pax
 
-            last_had = now_had
+                    if not any_items:
+                        update_fields["no_room_until_epoch"] = now + NO_ROOM_COOLDOWN_SECONDS
+                    else:
+                        update_fields["no_room_until_epoch"] = 0
+
+                    present_tiers = set(update_fields["last_seen_tiers"])
+                    notified_tiers = {
+                        to_int_or_none(x) for x in (monitor.get("notified_tiers") or [])
+                    }
+                    notified_tiers.discard(None)
+                    new_tiers = present_tiers - notified_tiers
+                    notify_mode = monitor.get("notify_mode", "per_tier_first_seen")
+                    baseline_tier = to_int_or_none(monitor.get("baseline_tier"))
+
+                    if notify_mode == "above_baseline_first_seen" and baseline_tier is not None:
+                        notify_tiers = {t for t in new_tiers if t > baseline_tier}
+                    else:
+                        notify_tiers = new_tiers
+
+                    for tier in sorted(notify_tiers, reverse=True):
+                        message = build_tier_message(monitor, tier, cabin_tiers.get(tier, []))
+                        notify({
+                            "type": "CRUISE_TIER_AVAILABLE",
+                            "at": time.time(),
+                            "message": message,
+                            "tier": tier,
+                        })
+                        notified_tiers.add(tier)
+
+                    update_fields["notified_tiers"] = sorted(notified_tiers)
+                    update_monitor_fields(monitor_key, update_fields)
+                except PermissionError:
+                    raise
+                except requests.HTTPError as ex:
+                    code = getattr(ex.response, "status_code", None)
+                    update_monitor_fields(monitor_key, {
+                        "last_check_at": ts(),
+                        "last_http": code or "HTTPError",
+                    })
+                    print(f"[{ts()}] [DAEMON] monitor http error key={monitor_key}:", repr(ex), flush=True)
+                    continue
+                except Exception as ex:
+                    update_monitor_fields(monitor_key, {
+                        "last_check_at": ts(),
+                        "last_http": "ERR",
+                    })
+                    print(f"[{ts()}] [DAEMON] monitor error key={monitor_key}:", repr(ex), flush=True)
+                    continue
+
             time.sleep(POLL_SECONDS)
 
         except Exception as e:
             print(f"[{ts()}] [DAEMON] error:", repr(e), flush=True)
             now = time.time()
 
-            # refresh/cabin 被 401/403 -> 通知你要手動登入一次
             if isinstance(e, PermissionError):
-                if now - last_alert_at > 300:  # 5 分鐘內不要狂洗
+                if now - last_alert_at > 300:
                     try:
                         notify({
                             "type": "CRUISE_NEED_RELOGIN",
@@ -162,18 +392,15 @@ def main():
                         print(f"[{ts()}] [DAEMON] notify failed:", repr(ex), flush=True)
                     last_alert_at = now
 
-                # ✅ 這裡：清空 bot_server tokens，避免一直拿壞 token 重試
                 try:
                     requests.post(f"{BOT}/cruise/tokens/clear", timeout=5)
                     print(f"[{ts()}] [DAEMON] tokens cleared on bot_server", flush=True)
                 except Exception as ex:
                     print(f"[{ts()}] [DAEMON] warn: failed to clear tokens:", repr(ex), flush=True)
 
-                time.sleep(60)  # 建議 60 秒，減少洗版
+                time.sleep(60)
                 continue
 
-
-            # 其他錯誤照舊（10 分鐘一次）
             if now - last_alert_at > 600:
                 try:
                     notify({
