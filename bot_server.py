@@ -82,6 +82,25 @@ def cruise_notify():
         cabins = data.get("cabins") or []
         text = f"🚢 有房通知！totalItems={total}\n" + "\n".join(cabins[:10])
 
+
+    elif t == "CRUISE_TIER_AVAILABLE":
+        tier = data.get("tier")
+        tier_short = data.get("tier_short") or (str(tier) if tier is not None else "\u623f\u578b")
+        tier_full = data.get("tier_full") or (f"{tier}\u5ba2\u623f" if tier is not None else "\u623f\u578b")
+        date = data.get("date") or ""
+        port_name = data.get("port_name") or ""
+        itinerary_name = data.get("itinerary_name") or ""
+        max_pax = data.get("max_pax")
+        max_pax_text = f"\uff08{max_pax}\u4eba\uff09" if isinstance(max_pax, int) and max_pax > 0 else ""
+
+        text = (
+            f"\U0001F6A2\u3010\u67e5\u5230\u53ef\u8a02\u623f\u3011{tier_short}{max_pax_text}\n"
+            f"\u65e5\u671f\uff1a{date}\n"
+            f"\u51fa\u767c\uff1a{port_name}\n"
+            f"\u822a\u7a0b\uff1a{itinerary_name}\n"
+            f"\u623f\u578b\uff1a{tier_full}"
+        )
+
     elif t == "CRUISE_NEED_RELOGIN":
         # daemon 偵測到 refresh / cabin 401/403 時會送這個
         err = data.get("error") or ""

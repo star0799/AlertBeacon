@@ -176,23 +176,14 @@ def build_params(monitor: dict, pax: int) -> dict | None:
     }
 
 
-def build_tier_message(monitor: dict, tier: int, cabins: list) -> str:
+def build_tier_text(tier: int) -> tuple[str, str]:
     tier_text_map = {
-        3: "\u9732\u53f0",
-        2: "\u6d77\u666f",
-        1: "\u5167\u5074",
+        3: ("\u9732\u53f0", "\u9732\u53f0\u5ba2\u623f"),
+        2: ("\u6d77\u666f", "\u6d77\u666f\u5ba2\u623f"),
+        1: ("\u5167\u5074", "\u5167\u5074\u5ba2\u623f"),
     }
-    date = monitor.get("departure_date") or monitor.get("date") or ""
-    port_name = monitor.get("port_name") or monitor.get("departure_port") or ""
-    itinerary_name = monitor.get("itinerary_name") or ""
-    tier_text = tier_text_map.get(tier, str(tier))
-    cabin_lines = "\n".join(cabins) if cabins else ""
-    return (
-        f"{date} {port_name}\n"
-        f"{itinerary_name}\n"
-        f"{tier_text}\n"
-        f"{cabin_lines}"
-    )
+    short_text, full_text = tier_text_map.get(tier, (str(tier), f"{tier}\u5ba2\u623f"))
+    return short_text, full_text
 
 
 def fetch_cabins(access: str, refresh_token: str, params: dict, user: str | None):
@@ -344,13 +335,20 @@ def main():
                         notify_tiers = new_tiers
 
                     for tier in sorted(notify_tiers, reverse=True):
-                        message = build_tier_message(monitor, tier, cabin_tiers.get(tier, []))
-                        notify({
+                        tier_short, tier_full = build_tier_text(tier)
+                        max_pax_value = to_int_or_none(update_fields.get("max_pax", monitor.get("max_pax")))
+                        payload = {
                             "type": "CRUISE_TIER_AVAILABLE",
                             "at": time.time(),
-                            "message": message,
-                            "tier": tier,
-                        })
+                            "tier": int(tier),
+                            "tier_short": tier_short,
+                            "tier_full": tier_full,
+                            "date": monitor.get("departure_date") or monitor.get("date") or "",
+                            "port_name": monitor.get("port_name") or "",
+                            "itinerary_name": monitor.get("itinerary_name") or "",
+                            "max_pax": max_pax_value,
+                        }
+                        notify(payload)
                         notified_tiers.add(tier)
 
                     update_fields["notified_tiers"] = sorted(notified_tiers)
