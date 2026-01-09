@@ -730,7 +730,13 @@ def handle_cruise_message(event):
         return
     date_match = re.search(r"\d{4}-\d{2}-\d{2}", raw_text)
     if not date_match:
-        help_text = "\u683c\u5f0f：YYYY-MM-DD [\u5167\u5074/\u6d77\u666f/\u9732\u53f0]\n\u4f8b\u5982：2026-02-27 \u6d77\u666f"
+        help_text = (
+            "\u53ef\u7528\u6307\u4ee4\uff1a\n\n"
+            "\u5217\u51fa\u76e3\u63a7 / \u76e3\u63a7\u5217\u8868 / \u986f\u793a\u76e3\u63a7 / \u5217\u51fa / \u5217\u8868\n"
+            "\u522a\u9664 YYYY-MM-DD / \u79fb\u9664 YYYY-MM-DD / \u53d6\u6d88 YYYY-MM-DD\n"
+            "YYYY-MM-DD [\u5167\u5074/\u6d77\u666f/\u9732\u53f0]\n"
+            "\u4f8b\u5982\uff1a2026-02-27 \u6d77\u666f"
+        )
         cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=help_text))
         return
     date = date_match.group(0)

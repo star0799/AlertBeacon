@@ -248,7 +248,7 @@ def main():
                 monitor_key = make_monitor_key(monitor)
                 try:
                     now = time.time()
-                    max_pax = monitor.get("max_pax")
+                    max_pax = to_int_or_none(monitor.get("max_pax"))
                     no_room_until = float(monitor.get("no_room_until_epoch") or 0)
 
                     if now < no_room_until:
@@ -370,7 +370,6 @@ def main():
                     })
                     print(f"[{ts()}] [DAEMON] monitor error key={monitor_key}:", repr(ex), flush=True)
                     continue
-
             time.sleep(POLL_SECONDS)
 
         except Exception as e:
