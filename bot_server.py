@@ -226,6 +226,12 @@ def update_cruise_monitors(mutator):
         return monitors
 
 
+def read_cruise_monitors():
+    lock = FileLock(CRUISE_MONITORS_FILE + ".lock")
+    with lock:
+        return read_json(CRUISE_MONITORS_FILE, [])
+
+
 def _cruise_headers(access_token: str) -> dict:
     return {
         "Authorization": f"Bearer {access_token}",
@@ -618,6 +624,110 @@ def handle_cruise_message(event):
     add_cruise_user(user_id)
 
     raw_text = (event.message.text or "").strip()
+
+    list_keywords = ("列出監控", "監控列表", "顯示監控", "列出", "列表","LIST","List","list")
+    delete_keywords = ("刪除", "移除", "取消","DELETE","Delete","delete")
+
+    if any(k in raw_text for k in list_keywords):
+        monitors = read_cruise_monitors()
+        if not monitors:
+            reply = "目前沒有監控航程"
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
+
+        def to_int_or_none(v):
+            try:
+                return int(v)
+            except Exception:
+                return None
+
+        def tier_name(tier):
+            if tier == 3:
+                return "露台"
+            if tier == 2:
+                return "海景"
+            if tier == 1:
+                return "內側"
+            return str(tier)
+
+        lines = []
+        for m in monitors[:10]:
+            date = m.get("date") or ""
+            enabled = bool(m.get("enabled", False))
+            status_txt = "啟用" if enabled else "停用"
+            port_name = m.get("port_name") or str(m.get("departure_port") or "")
+            itinerary_name = m.get("itinerary_name") or ""
+            notify_mode = m.get("notify_mode")
+            baseline_tier = to_int_or_none(m.get("baseline_tier"))
+
+            if notify_mode == "per_tier_first_seen":
+                rule = "各等級首次出現各通知一次"
+            elif notify_mode == "above_baseline_first_seen" and baseline_tier == 1:
+                rule = "海景/露台出現才通知"
+            elif notify_mode == "above_baseline_first_seen" and baseline_tier == 2:
+                rule = "只通知露台"
+            else:
+                if baseline_tier is None:
+                    rule = "（未知規則）"
+                else:
+                    rule = f"{tier_name(baseline_tier)}以上才通知"
+
+            max_pax = m.get("max_pax")
+            pax_text = f"{max_pax}人" if isinstance(max_pax, int) and max_pax > 0 else "未確定"
+            last_check = m.get("last_check_at") or "尚未檢查"
+
+            tiers = m.get("last_seen_tiers") or []
+            if tiers:
+                tiers_txt = "/".join(tier_name(t) for t in tiers)
+            else:
+                tiers_txt = "目前無房"
+
+            block = "\n".join([
+                f"日期：{date}",
+                f"出發：{port_name}",
+                f"航程：{itinerary_name}",
+                f"人數：{pax_text}",
+                f"最後監控：{last_check}",
+                f"目前房型：{tiers_txt}",
+            ])
+            lines.append(block)
+
+        reply = "\n\n".join(lines)
+        if len(monitors) > 10:
+            reply = reply + "\n(其餘省略)"
+        cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
+
+    if any(k in raw_text for k in delete_keywords):
+        date_match = re.search(r"\d{4}-\d{2}-\d{2}", raw_text)
+        if not date_match:
+            reply = "請輸入：刪除 YYYY-MM-DD"
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
+        date = date_match.group(0)
+        try:
+            datetime.strptime(date, "%Y-%m-%d")
+        except ValueError:
+            reply = "日期不合法，請輸入 YYYY-MM-DD"
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
+
+        result = {"removed": False}
+
+        def mut(monitors_list):
+            before = len(monitors_list)
+            monitors_list[:] = [m for m in monitors_list if m.get("date") != date]
+            if len(monitors_list) < before:
+                result["removed"] = True
+
+        update_cruise_monitors(mut)
+
+        if result["removed"]:
+            reply = f"✅ 已刪除監控：{date}"
+        else:
+            reply = f"找不到監控：{date}"
+        cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
     date_match = re.search(r"\d{4}-\d{2}-\d{2}", raw_text)
     if not date_match:
         help_text = "\u683c\u5f0f：YYYY-MM-DD [\u5167\u5074/\u6d77\u666f/\u9732\u53f0]\n\u4f8b\u5982：2026-02-27 \u6d77\u666f"
