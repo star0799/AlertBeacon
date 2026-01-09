@@ -7,7 +7,7 @@ from filelock import FileLock
 
 BASE = "https://backend-prd.b2m.stardreamcruises.com"
 BOT = "http://127.0.0.1:5000"
-POLL_SECONDS = 30
+POLL_SECONDS = 60
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MONITORS_FILE = os.path.join(BASE_DIR, "monitors_cruise.json")
 TIER_RULES_FILE = os.path.join(BASE_DIR, "cabin_name")
@@ -234,7 +234,7 @@ def main():
             tokens = get_tokens()
             if not tokens:
                 print(f"[{ts()}] [DAEMON] waiting for tokens... (please login once)", flush=True)
-                time.sleep(30)
+                time.sleep(300)
                 continue
             access = tokens["accessToken"]
             refresh_token = tokens["refreshToken"]
