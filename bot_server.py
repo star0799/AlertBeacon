@@ -43,6 +43,8 @@ USERS_FILE = "users.json"
 USERS_CRUISE_FILE = "users_cruise.json"
 MONITORS_FILE = "monitors.json"
 TOKENS_CACHE_FILE = "latest_tokens.json"
+CRUISE_MONITORS_FILE = "monitors_cruise.json"
+CRUISE_BACKEND_BASE = "https://backend-prd.b2m.stardreamcruises.com"
 
 _latest_recaptcha = {"token": None, "at": None, "action": None}
 _latest_tokens = {"accessToken": None, "refreshToken": None, "user": None, "at": None}
@@ -214,9 +216,64 @@ def update_monitors(mutator):
         return monitors
 
 
-# ------------------------------------------------------
-# 時間 / alive 判斷
-# ------------------------------------------------------
+def update_cruise_monitors(mutator):
+    """mutator(monitors_list) -> read/modify/write monitors_cruise.json under lock"""
+    lock = FileLock(CRUISE_MONITORS_FILE + ".lock")
+    with lock:
+        monitors = read_json(CRUISE_MONITORS_FILE, [])
+        mutator(monitors)
+        write_json(CRUISE_MONITORS_FILE, monitors)
+        return monitors
+
+
+def _cruise_headers(access_token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json, text/plain, */*",
+        "timezone": "Asia/Taipei",
+    }
+
+
+def fetch_itinerary(access_token: str, date: str) -> str | None:
+    url = f"{CRUISE_BACKEND_BASE}/customers/list/itinerary"
+    params = {"departure_date": date, "lang": "hant", "page": 1}
+    r = requests.get(url, params=params, headers=_cruise_headers(access_token), timeout=10)
+    r.raise_for_status()
+    items = (r.json() or {}).get("items") or []
+    for it in items:
+        name = it.get("traditional_chinese_name") or ""
+        if "\u63a2\u7d22\u661f\u865f" in name:
+            return name
+    return None
+
+
+def fetch_port(access_token: str, date: str) -> dict | None:
+    url = f"{CRUISE_BACKEND_BASE}/customers/list/port"
+    params = {"departure_date": date, "lang": "hant", "page": 1}
+    r = requests.get(url, params=params, headers=_cruise_headers(access_token), timeout=10)
+    r.raise_for_status()
+    items = (r.json() or {}).get("items") or []
+    if not items:
+        return None
+
+    def pick_port(match_name: str, match_code: str):
+        for p in items:
+            if (p.get("traditional_chinese_port_name") == match_name) or (p.get("port_code") == match_code):
+                return p
+        return None
+
+    picked = (
+        pick_port("\u57fa\u9686", "KEL")
+        or pick_port("\u9ad8\u96c4", "KHH")
+        or items[0]
+    )
+    return {
+        "departure_port": picked.get("id"),
+        "port_code": picked.get("port_code"),
+        "port_name": picked.get("traditional_chinese_port_name") or picked.get("port_name") or "",
+    }
+
+
 def now_ts() -> float:
     return time.time()
 
@@ -559,7 +616,124 @@ def handle_costco_message(event):
 def handle_cruise_message(event):
     user_id = event.source.user_id
     add_cruise_user(user_id)
-    cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text="cruise ok"))
+
+    raw_text = (event.message.text or "").strip()
+    date_match = re.search(r"\d{4}-\d{2}-\d{2}", raw_text)
+    if not date_match:
+        help_text = "\u683c\u5f0f：YYYY-MM-DD [\u5167\u5074/\u6d77\u666f/\u9732\u53f0]\n\u4f8b\u5982：2026-02-27 \u6d77\u666f"
+        cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=help_text))
+        return
+    date = date_match.group(0)
+    try:
+        datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        reply = "日期不合法，請輸入 YYYY-MM-DD"
+        cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
+
+    if any(k in raw_text for k in ("\u9732\u53f0", "\u9732\u81fa", "\u967d\u53f0")):
+        tier_short = "\u9732\u53f0"
+        notify_mode = "above_baseline_first_seen"
+        baseline_tier = 2
+    elif "\u6d77\u666f" in raw_text:
+        tier_short = "\u6d77\u666f"
+        notify_mode = "above_baseline_first_seen"
+        baseline_tier = 1
+    elif ("\u5167\u5074" in raw_text) or ("\u5167\u8259" in raw_text):
+        tier_short = "\u5167\u5074"
+        notify_mode = "per_tier_first_seen"
+        baseline_tier = 1
+    else:
+        tier_short = "\u5167\u5074"
+        notify_mode = "per_tier_first_seen"
+        baseline_tier = 1
+
+    if notify_mode == "per_tier_first_seen":
+        rule_text = "\u5404\u7b49\u7d1a\u9996\u6b21\u51fa\u73fe\u5404\u901a\u77e5\u4e00\u6b21"
+    elif notify_mode == "above_baseline_first_seen":
+        if tier_short == "\u6d77\u666f":
+            rule_text = "\u6d77\u666f/\u9732\u53f0\u51fa\u73fe\u624d\u901a\u77e5"
+        elif tier_short == "\u9732\u53f0":
+            rule_text = "\u53ea\u901a\u77e5\u9732\u53f0"
+        else:
+            rule_text = f"{tier_short}\u4ee5\u4e0a\u624d\u901a\u77e5"
+    else:
+        rule_text = f"{tier_short}\u4ee5\u4e0a\u624d\u901a\u77e5"
+
+    access = _latest_tokens.get("accessToken")
+    if not access:
+        reply = "\u8acb\u5148\u624b\u52d5\u767b\u5165\u4e00\u6b21\u8b93 Token Sync \u56de\u704c"
+        cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
+
+    try:
+        itinerary_name = fetch_itinerary(access, date)
+        if not itinerary_name:
+            reply = "\u8a72\u65e5\u671f\u6c92\u6709\u63a2\u7d22\u661f\u865f\u822a\u7a0b"
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
+
+        port_info = fetch_port(access, date)
+        if not port_info or port_info.get("departure_port") is None:
+            reply = "\u67e5\u7121\u53ef\u7528\u51fa\u767c\u6e2f\u53e3"
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
+    except Exception as ex:
+        print(f"[{ts()}] [CRUISE] warn: failed to fetch cruise list:", repr(ex), flush=True)
+        reply = "\u67e5\u8a62\u822a\u7a0b\u5931\u6557，\u8acb\u7a0d\u5f8c\u518d\u8a66"
+        cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
+
+    result = {"updated": False, "added": False}
+
+    def mut(monitors_list):
+        for m in monitors_list:
+            if m.get("date") == date:
+                m["lang"] = "hant"
+                m["itinerary_name"] = itinerary_name
+                m["departure_port"] = port_info.get("departure_port")
+                m["port_code"] = port_info.get("port_code")
+                m["port_name"] = port_info.get("port_name")
+                m["notify_mode"] = notify_mode
+                m["baseline_tier"] = baseline_tier
+                m["notified_tiers"] = []
+                m["enabled"] = True
+                m["no_room_until_epoch"] = 0
+                result["updated"] = True
+                return
+
+        monitors_list.append({
+            "date": date,
+            "enabled": True,
+            "lang": "hant",
+            "itinerary_name": itinerary_name,
+            "departure_port": port_info.get("departure_port"),
+            "port_code": port_info.get("port_code"),
+            "port_name": port_info.get("port_name"),
+            "baseline_tier": baseline_tier,
+            "notify_mode": notify_mode,
+            "max_pax": None,
+            "last_check_at": None,
+            "last_http": None,
+            "last_seen_cabins": [],
+            "last_seen_tiers": [],
+            "notified_tiers": [],
+            "no_room_until_epoch": 0,
+        })
+        result["added"] = True
+
+    update_cruise_monitors(mut)
+
+    status = "✅ \u5df2\u66f4\u65b0\u76e3\u63a7" if result["updated"] else "✅ \u5df2\u65b0\u589e\u76e3\u63a7"
+    reply = (
+        f"{status}\n"
+        f"\u65e5\u671f：{date}\n"
+        f"\u51fa\u767c：{port_info.get('port_name', '')}\n"
+        f"\u822a\u7a0b：{itinerary_name}\n"
+        f"\u901a\u77e5\u898f\u5247：{rule_text}\n"
+        "daemon \u6703\u81ea\u52d5\u67e5\u623f"
+    )
+    cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
 
 # ------------------------------------------------------
