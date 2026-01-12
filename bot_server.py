@@ -55,6 +55,7 @@ def cruise_tokens():
     data = request.get_json(force=True, silent=True) or {}
     if not data.get("accessToken") or not data.get("refreshToken"):
         return jsonify({"ok": False, "error": "missing tokens"}), 400
+    was_missing = not (_latest_tokens.get("accessToken") and _latest_tokens.get("refreshToken"))
     _latest_tokens.update({
         "accessToken": data["accessToken"],
         "refreshToken": data["refreshToken"],
@@ -63,6 +64,15 @@ def cruise_tokens():
     })
     write_json(TOKENS_CACHE_FILE, _latest_tokens)
     print(f"[{ts()}] [CRUISE] tokens updated", _latest_tokens["at"])
+    if was_missing:
+        users = read_json(USERS_CRUISE_FILE, [])
+        if users:
+            msg = TextSendMessage(text="✅ Cruise token 已更新，監控已恢復。")
+            for uid in users:
+                try:
+                    cruise_line_bot_api.push_message(uid, msg)
+                except Exception as e:
+                    print(f"[{ts()}] [CRUISE] notify failed:", uid, repr(e), flush=True)
     return jsonify({"ok": True})
 
 @app.get("/cruise/tokens")
@@ -691,8 +701,16 @@ def handle_cruise_message(event):
                 return "內側"
             return str(tier)
 
+        def parse_date(v: str):
+            try:
+                return datetime.strptime(v, "%Y-%m-%d")
+            except Exception:
+                return datetime.max
+
+        monitors_sorted = sorted(monitors, key=lambda m: parse_date(m.get("date") or ""))
+
         lines = []
-        for m in monitors[:10]:
+        for m in monitors_sorted[:10]:
             date = m.get("date") or ""
             enabled = bool(m.get("enabled", False))
             status_txt = "啟用" if enabled else "停用"
@@ -734,7 +752,7 @@ def handle_cruise_message(event):
             lines.append(block)
 
         reply = "\n\n".join(lines)
-        if len(monitors) > 10:
+        if len(monitors_sorted) > 10:
             reply = reply + "\n(其餘省略)"
         cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
