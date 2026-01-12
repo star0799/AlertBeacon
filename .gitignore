@@ -14,3 +14,4 @@ state/
 state/
 .vscode
 users_cruise.json
+monitors_cruise.json
