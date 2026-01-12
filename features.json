@@ -1,0 +1,6 @@
+{
+  "bot_server": true,
+  "costco": false,
+  "cruise_daemon": true,
+  "ngrok": true
+}

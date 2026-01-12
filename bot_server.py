@@ -43,6 +43,7 @@ USERS_FILE = "users.json"
 USERS_CRUISE_FILE = "users_cruise.json"
 MONITORS_FILE = "monitors.json"
 TOKENS_CACHE_FILE = "latest_tokens.json"
+FEATURES_FILE = "features.json"
 CRUISE_MONITORS_FILE = "monitors_cruise.json"
 CRUISE_BACKEND_BASE = "https://backend-prd.b2m.stardreamcruises.com"
 
@@ -72,6 +73,10 @@ def cruise_tokens_get():
 def cruise_notify():
     data = request.get_json(force=True, silent=True) or {}
     print(f"[{ts()}] [CRUISE NOTIFY]", json.dumps(data, ensure_ascii=False))
+
+    if not feature_enabled("cruise"):
+        print(f"[{ts()}] [CRUISE] cruise disabled", flush=True)
+        return jsonify({"ok": False, "error": "cruise disabled"}), 503
 
     users = read_json(USERS_CRUISE_FILE, [])
     if not users:
@@ -200,8 +205,34 @@ def write_json(path: str, data):
     except Exception as e:
         print(f"[{ts()}] ⚠️ 寫入 {path} 失敗：{e}")
 
+
+def load_features() -> dict:
+    defaults = {"costco": True, "cruise": True, "linebot": True, "ngrok": True}
+    try:
+        if not os.path.exists(FEATURES_FILE):
+            return defaults
+        lock = FileLock(FEATURES_FILE + ".lock")
+        with lock:
+            data = read_json(FEATURES_FILE, defaults)
+    except Exception as e:
+        print(f"[{ts()}] ⚠️ 讀取 {FEATURES_FILE} 失敗：{e}")
+        return defaults
+    if not isinstance(data, dict):
+        return defaults
+    merged = defaults.copy()
+    for key, value in data.items():
+        if key in merged:
+            merged[key] = bool(value)
+    return merged
+
+
+def feature_enabled(name: str) -> bool:
+    return bool(FEATURES.get(name, True))
+
+
 #
 _latest_tokens.update(read_json(TOKENS_CACHE_FILE, _latest_tokens))
+FEATURES = load_features()
 #
 # ------------------------------------------------------
 # monitors.json 專用：一次 read-modify-write（有檔案鎖）
@@ -423,6 +454,11 @@ def handle_costco_message(event):
     user_id = event.source.user_id
     add_user(user_id)
 
+    if not feature_enabled("costco"):
+        reply = "Costco 功能目前停用"
+        costco_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
+
     raw_text = event.message.text.strip()
     text = raw_text.lower()
     parts = raw_text.split()
@@ -622,6 +658,11 @@ def handle_costco_message(event):
 def handle_cruise_message(event):
     user_id = event.source.user_id
     add_cruise_user(user_id)
+
+    if not feature_enabled("cruise"):
+        reply = "Cruise 功能目前停用"
+        cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
 
     raw_text = (event.message.text or "").strip()
 

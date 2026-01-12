@@ -234,7 +234,7 @@ def main():
             tokens = get_tokens()
             if not tokens:
                 print(f"[{ts()}] [DAEMON] waiting for tokens... (please login once)", flush=True)
-                time.sleep(300)
+                time.sleep(180)
                 continue
             access = tokens["accessToken"]
             refresh_token = tokens["refreshToken"]
