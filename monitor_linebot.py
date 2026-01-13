@@ -13,6 +13,7 @@ from filelock import FileLock
 MONITOR_FILE = "monitors.json"
 USERS_FILE = "users.json"
 FEATURES_FILE = "features.json"
+FEATURE_CHECK_SECONDS = 10
 
 LOG_FOLDER = "logs"
 os.makedirs(LOG_FOLDER, exist_ok=True)
@@ -197,7 +198,7 @@ def main():
             if not paused:
                 log(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] \u23f8\ufe0f Costco \u76e3\u63a7\u5df2\u505c\u7528\uff0c\u66ab\u505c\u6aa2\u67e5\u4e2d")
                 paused = True
-            time.sleep(5)
+            time.sleep(FEATURE_CHECK_SECONDS)
             continue
         if paused:
             log(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] \u2705 Costco \u76e3\u63a7\u5df2\u555f\u7528\uff0c\u6062\u5fa9\u6aa2\u67e5")

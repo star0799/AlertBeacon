@@ -12,7 +12,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MONITORS_FILE = os.path.join(BASE_DIR, "monitors_cruise.json")
 TIER_RULES_FILE = os.path.join(BASE_DIR, "cabin_name")
 FEATURES_FILE = os.path.join(BASE_DIR, "features.json")
-NO_ROOM_COOLDOWN_SECONDS = 300
+NO_ROOM_COOLDOWN_SECONDS = 0
+FEATURE_CHECK_SECONDS = 10
 
 
 def ts() -> str:
@@ -258,7 +259,7 @@ def main():
             if not paused:
                 print(f"[{ts()}] ⏸️ Cruise 監控已停用，暫停檢查中", flush=True)
                 paused = True
-            time.sleep(5)
+            time.sleep(FEATURE_CHECK_SECONDS)
             continue
         if paused:
             print(f"[{ts()}] ✅ Cruise 監控已啟用，恢復檢查", flush=True)
@@ -305,11 +306,15 @@ def main():
                         status_code, data, access, refresh_token = fetch_cabins(
                             access, refresh_token, params, user
                         )
+                        items = data.get("items", []) or []
+                        print(
+                            f"[{ts()}] [DAEMON] result key={monitor_key} pax={pax} "
+                            f"status={status_code} items={len(items)}",
+                            flush=True,
+                        )
                         last_http = status_code
                         if status_code == 200:
                             any_http_200 = True
-
-                        items = data.get("items", []) or []
                         if items:
                             last_items = items
                             any_items = True
