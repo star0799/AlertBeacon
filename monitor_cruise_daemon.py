@@ -121,6 +121,16 @@ def read_features():
 def feature_enabled(name: str) -> bool:
     return bool(read_features().get(name, True))
 
+def sleep_with_feature_checks(total_seconds: int):
+    end_at = time.time() + total_seconds
+    while True:
+        if not feature_enabled("cruise_daemon"):
+            return
+        remaining = end_at - time.time()
+        if remaining <= 0:
+            return
+        time.sleep(min(FEATURE_CHECK_SECONDS, remaining))
+
 def read_monitors():
     lock = FileLock(MONITORS_FILE + ".lock")
     with lock:
@@ -269,7 +279,7 @@ def main():
             tokens = get_tokens()
             if not tokens:
                 print(f"[{ts()}] [DAEMON] waiting for tokens... (please login once)", flush=True)
-                time.sleep(30)
+                sleep_with_feature_checks(30)
                 continue
             access = tokens["accessToken"]
             refresh_token = tokens["refreshToken"]
@@ -409,7 +419,7 @@ def main():
                     })
                     print(f"[{ts()}] [DAEMON] monitor error key={monitor_key}:", repr(ex), flush=True)
                     continue
-            time.sleep(POLL_SECONDS)
+            sleep_with_feature_checks(POLL_SECONDS)
 
         except Exception as e:
             print(f"[{ts()}] [DAEMON] error:", repr(e), flush=True)
@@ -434,7 +444,7 @@ def main():
                 except Exception as ex:
                     print(f"[{ts()}] [DAEMON] warn: failed to clear tokens:", repr(ex), flush=True)
 
-                time.sleep(60)
+                sleep_with_feature_checks(60)
                 continue
 
             if now - last_alert_at > 600:
@@ -448,7 +458,7 @@ def main():
                     print(f"[{ts()}] [DAEMON] notify failed:", repr(ex), flush=True)
                 last_alert_at = now
 
-            time.sleep(10)
+            sleep_with_feature_checks(10)
 
 
 if __name__ == "__main__":
