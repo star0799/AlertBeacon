@@ -84,7 +84,7 @@ def cruise_notify():
     data = request.get_json(force=True, silent=True) or {}
     print(f"[{ts()}] [CRUISE NOTIFY]", json.dumps(data, ensure_ascii=False))
 
-    if not feature_enabled("cruise"):
+    if not feature_enabled("cruise_daemon"):
         print(f"[{ts()}] [CRUISE] cruise disabled", flush=True)
         return jsonify({"ok": False, "error": "cruise disabled"}), 503
 
@@ -217,7 +217,12 @@ def write_json(path: str, data):
 
 
 def load_features() -> dict:
-    defaults = {"costco": True, "cruise": True, "linebot": True, "ngrok": True}
+    defaults = {
+        "bot_server": True,
+        "costco": True,
+        "cruise_daemon": True,
+        "ngrok": True,
+    }
     try:
         if not os.path.exists(FEATURES_FILE):
             return defaults
@@ -238,6 +243,22 @@ def load_features() -> dict:
 
 def feature_enabled(name: str) -> bool:
     return bool(FEATURES.get(name, True))
+
+
+def set_feature(name: str, enabled: bool) -> bool:
+    try:
+        lock = FileLock(FEATURES_FILE + ".lock")
+        with lock:
+            data = read_json(FEATURES_FILE, {})
+            if not isinstance(data, dict):
+                data = {}
+            data[name] = bool(enabled)
+            write_json(FEATURES_FILE, data)
+        FEATURES[name] = bool(enabled)
+        return True
+    except Exception as e:
+        print(f"[{ts()}] ⚠️ 更新 {FEATURES_FILE} 失敗：{e}")
+        return False
 
 
 #
@@ -464,15 +485,36 @@ def handle_costco_message(event):
     user_id = event.source.user_id
     add_user(user_id)
 
-    if not feature_enabled("costco"):
-        reply = "Costco 功能目前停用"
-        costco_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-        return
-
     raw_text = event.message.text.strip()
     text = raw_text.lower()
     parts = raw_text.split()
     cmd = parts[0].lower() if parts else ""
+    raw_text_lower = raw_text.lower()
+
+    enable_cmds = ("\u555f\u7528", "\u958b\u555f", "\u5f00\u542f", "enable", "on")
+    disable_cmds = ("\u505c\u7528", "\u95dc\u9589", "\u5173\u95ed", "disable", "off")
+    toggle = None
+    if cmd in enable_cmds or raw_text in enable_cmds or raw_text_lower in enable_cmds:
+        toggle = True
+    elif cmd in disable_cmds or raw_text in disable_cmds or raw_text_lower in disable_cmds:
+        toggle = False
+    elif any(raw_text.startswith(k) for k in enable_cmds):
+        toggle = True
+    elif any(raw_text.startswith(k) for k in disable_cmds):
+        toggle = False
+
+    if toggle is not None:
+        ok = set_feature("costco", toggle)
+        state = "\u555f\u7528" if toggle else "\u505c\u7528"
+        print(f"[{ts()}] [COSTCO] feature {state}", flush=True)
+        reply = f"\u2705 Costco \u529f\u80fd\u5df2{state}" if ok else "\u2757 \u7121\u6cd5\u66f4\u65b0 features.json"
+        costco_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
+
+    if not feature_enabled("costco"):
+        reply = "Costco \u529f\u80fd\u76ee\u524d\u505c\u7528"
+        costco_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
 
     # ==================================================
     # 1) 查庫存 / stock
@@ -657,6 +699,7 @@ def handle_costco_message(event):
         "可用指令：\n\n"
         "📦 庫存 / stock  → 立即重查所有庫存\n"
         "📄 列出監控 / 監控 / list  → 顯示監控清單與狀態\n"
+        "\u529F\u80FD\u958B\u95DC\uff1a\u555f\u7528 / \u505c\u7528\n"
         "➕ 新增 [URL] [秒數] / add [URL] [秒數]  (未輸入秒數預設3分鐘)\n"
         "➖ 移除 [URL] / remove [URL]"
     )
@@ -669,15 +712,46 @@ def handle_cruise_message(event):
     user_id = event.source.user_id
     add_cruise_user(user_id)
 
-    if not feature_enabled("cruise"):
-        reply = "Cruise 功能目前停用"
+    raw_text = (event.message.text or "").strip()
+    raw_text_lower = raw_text.lower()
+
+    enable_cmds = ("\u555f\u7528", "\u958b\u555f", "\u5f00\u542f", "enable", "on")
+    disable_cmds = ("\u505c\u7528", "\u95dc\u9589", "\u5173\u95ed", "disable", "off")
+    toggle = None
+    if raw_text in enable_cmds or raw_text_lower in enable_cmds:
+        toggle = True
+    elif raw_text in disable_cmds or raw_text_lower in disable_cmds:
+        toggle = False
+    elif any(raw_text.startswith(k) for k in enable_cmds):
+        toggle = True
+    elif any(raw_text.startswith(k) for k in disable_cmds):
+        toggle = False
+
+    if toggle is not None:
+        ok = set_feature("cruise_daemon", toggle)
+        state = "\u555f\u7528" if toggle else "\u505c\u7528"
+        print(f"[{ts()}] [CRUISE] feature {state}", flush=True)
+        reply = f"\u2705 Cruise \u529f\u80fd\u5df2{state}" if ok else "\u2757 \u7121\u6cd5\u66f4\u65b0 features.json"
         cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
 
-    raw_text = (event.message.text or "").strip()
+    if not feature_enabled("cruise_daemon"):
+        reply = "Cruise \u529f\u80fd\u76ee\u524d\u505c\u7528"
+        cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
 
     list_keywords = ("列出監控", "監控列表", "顯示監控", "列出", "列表","LIST","List","list")
     delete_keywords = ("刪除", "移除", "取消","DELETE","Delete","delete")
+
+    def parse_date_text(text: str) -> str | None:
+        m = re.search(r"(\d{4})[-/\.]?(\d{2})[-/\.]?(\d{2})", text)
+        if not m:
+            return None
+        y, mo, d = (int(v) for v in m.groups())
+        try:
+            return datetime(y, mo, d).strftime("%Y-%m-%d")
+        except ValueError:
+            return None
 
     if any(k in raw_text for k in list_keywords):
         monitors = read_cruise_monitors()
@@ -758,19 +832,11 @@ def handle_cruise_message(event):
         return
 
     if any(k in raw_text for k in delete_keywords):
-        date_match = re.search(r"\d{4}-\d{2}-\d{2}", raw_text)
-        if not date_match:
-            reply = "請輸入：刪除 YYYY-MM-DD"
+        date = parse_date_text(raw_text)
+        if not date:
+            reply = "\u8ACB\u8F38\u5165\uFF1A\u522A\u9664 YYYY-MM-DD\uFF08\u4E5F\u652F\u63F4 YYYYMMDD / YYYY/MM/DD / YYYY.MM.DD\uFF09"
             cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
             return
-        date = date_match.group(0)
-        try:
-            datetime.strptime(date, "%Y-%m-%d")
-        except ValueError:
-            reply = "日期不合法，請輸入 YYYY-MM-DD"
-            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-            return
-
         result = {"removed": False}
 
         def mut(monitors_list):
@@ -787,23 +853,17 @@ def handle_cruise_message(event):
             reply = f"找不到監控：{date}"
         cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
-    date_match = re.search(r"\d{4}-\d{2}-\d{2}", raw_text)
-    if not date_match:
+    date = parse_date_text(raw_text)
+    if not date:
         help_text = (
             "\u53ef\u7528\u6307\u4ee4\uff1a\n\n"
             "\u5217\u51fa\u76e3\u63a7 / \u76e3\u63a7\u5217\u8868 / \u986f\u793a\u76e3\u63a7 / \u5217\u51fa / \u5217\u8868\n"
-            "\u522a\u9664 YYYY-MM-DD / \u79fb\u9664 YYYY-MM-DD / \u53d6\u6d88 YYYY-MM-DD\n"
+            "\u522A\u9664/\u79FB\u9664/\u53D6\u6D88 YYYY-MM-DD\uFF08\u4E5F\u652F\u63F4 YYYYMMDD / YYYY/MM/DD / YYYY.MM.DD\uFF09\n"
+            "\u529F\u80FD\u958B\u95DC\uff1a\u555f\u7528 / \u505c\u7528\n"
             "YYYY-MM-DD [\u5167\u5074/\u6d77\u666f/\u9732\u53f0]\n"
             "\u4f8b\u5982\uff1a2026-02-27 \u6d77\u666f"
         )
         cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=help_text))
-        return
-    date = date_match.group(0)
-    try:
-        datetime.strptime(date, "%Y-%m-%d")
-    except ValueError:
-        reply = "日期不合法，請輸入 YYYY-MM-DD"
-        cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
 
     if any(k in raw_text for k in ("\u9732\u53f0", "\u9732\u81fa", "\u967d\u53f0")):

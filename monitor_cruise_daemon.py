@@ -11,6 +11,7 @@ POLL_SECONDS = 60
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MONITORS_FILE = os.path.join(BASE_DIR, "monitors_cruise.json")
 TIER_RULES_FILE = os.path.join(BASE_DIR, "cabin_name")
+FEATURES_FILE = os.path.join(BASE_DIR, "features.json")
 NO_ROOM_COOLDOWN_SECONDS = 300
 
 
@@ -96,6 +97,28 @@ def write_json(path: str, data):
     except Exception as e:
         print(f"[{ts()}] [DAEMON] warn: failed to write {path}:", repr(e), flush=True)
 
+
+def read_features():
+    defaults = {"cruise_daemon": True}
+    try:
+        if not os.path.exists(FEATURES_FILE):
+            return defaults
+        lock = FileLock(FEATURES_FILE + ".lock")
+        with lock:
+            data = read_json(FEATURES_FILE, defaults)
+    except Exception as e:
+        print(f"[{ts()}] [DAEMON] warn: failed to read {FEATURES_FILE}:", repr(e), flush=True)
+        return defaults
+    if not isinstance(data, dict):
+        return defaults
+    merged = defaults.copy()
+    for key, value in data.items():
+        if key in merged:
+            merged[key] = bool(value)
+    return merged
+
+def feature_enabled(name: str) -> bool:
+    return bool(read_features().get(name, True))
 
 def read_monitors():
     lock = FileLock(MONITORS_FILE + ".lock")
@@ -225,11 +248,22 @@ def main():
     load_dotenv()
 
     print(f"[{ts()}] [DAEMON] started. polling every {POLL_SECONDS} seconds", flush=True)
+    paused = False
 
     last_alert_at = 0.0
     tier_rules = load_tier_rules()
 
     while True:
+        if not feature_enabled("cruise_daemon"):
+            if not paused:
+                print(f"[{ts()}] ⏸️ Cruise 監控已停用，暫停檢查中", flush=True)
+                paused = True
+            time.sleep(5)
+            continue
+        if paused:
+            print(f"[{ts()}] ✅ Cruise 監控已啟用，恢復檢查", flush=True)
+            paused = False
+
         try:
             tokens = get_tokens()
             if not tokens:

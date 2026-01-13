@@ -12,6 +12,7 @@ from filelock import FileLock
 
 MONITOR_FILE = "monitors.json"
 USERS_FILE = "users.json"
+FEATURES_FILE = "features.json"
 
 LOG_FOLDER = "logs"
 os.makedirs(LOG_FOLDER, exist_ok=True)
@@ -77,6 +78,28 @@ def update_monitors(mutator):
         write_json(MONITOR_FILE, monitors)
         return monitors
 
+
+def read_features():
+    defaults = {"costco": True}
+    try:
+        if not os.path.exists(FEATURES_FILE):
+            return defaults
+        lock = FileLock(FEATURES_FILE + ".lock")
+        with lock:
+            data = read_json(FEATURES_FILE, defaults)
+    except Exception as e:
+        log("\u26a0\ufe0f \u8b80\u53d6 {} \u5931\u6557\uff1a{}: {}".format(FEATURES_FILE, type(e).__name__, e))
+        return defaults
+    if not isinstance(data, dict):
+        return defaults
+    merged = defaults.copy()
+    for key, value in data.items():
+        if key in merged:
+            merged[key] = bool(value)
+    return merged
+
+def feature_enabled(name: str) -> bool:
+    return bool(read_features().get(name, True))
 # ------------------------------------------------------
 # 推播
 # ------------------------------------------------------
@@ -167,8 +190,19 @@ def confirm_in_stock(url: str, tries: int = 3, delay: int = 3) -> bool:
 # ------------------------------------------------------
 def main():
     log("📡 監控程式啟動")
+    paused = False
 
     while True:
+        if not feature_enabled("costco"):
+            if not paused:
+                log(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] \u23f8\ufe0f Costco \u76e3\u63a7\u5df2\u505c\u7528\uff0c\u66ab\u505c\u6aa2\u67e5\u4e2d")
+                paused = True
+            time.sleep(5)
+            continue
+        if paused:
+            log(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] \u2705 Costco \u76e3\u63a7\u5df2\u555f\u7528\uff0c\u6062\u5fa9\u6aa2\u67e5")
+            paused = False
+
         monitors_snapshot = read_json(MONITOR_FILE, [])
         now_ts = time.time()
 
