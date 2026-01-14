@@ -11,6 +11,7 @@ import json
 import re
 import time
 import requests
+import secrets
 from bs4 import BeautifulSoup
 from datetime import datetime
 from dotenv import load_dotenv
@@ -85,46 +86,118 @@ def cruise_tokens_get():
     return jsonify(_latest_tokens)
 
 
-# @app.get("/cruise/pay/<code>")
-# def cruise_pay(code: str):
-#     if not os.path.exists(PAY_LINKS_FILE):
-#         return jsonify({"ok": False, "error": f"pay_links not found: {PAY_LINKS_FILE}"}), 404
-#     lock = FileLock(PAY_LINKS_LOCK)
-#     with lock:
-#         links = read_json(PAY_LINKS_FILE, {})
-#     if not isinstance(links, dict) or code not in links:
-#         return jsonify({"ok": False, "error": f"unknown code: {code}"}), 404
+@app.get("/cruise/pay/<code>")
+def cruise_pay(code: str):
+    if not os.path.exists(PAY_LINKS_FILE):
+        return jsonify({"ok": False, "error": f"pay_links not found: {PAY_LINKS_FILE}"}), 404
+    lock = FileLock(PAY_LINKS_LOCK)
+    with lock:
+        links = read_json_utf8sig(PAY_LINKS_FILE, {})
+    if not isinstance(links, dict) or code not in links:
+        return jsonify({"ok": False, "error": f"unknown code: {code}"}), 404
 
-#     access_token = get_latest_access_token()
-#     if not access_token:
-#         return "No access token found. Please login and sync tokens first.", 500
+    access_token = get_latest_access_token()
+    if not access_token:
+        return "No access token found. Please login and sync tokens first.", 500
 
-#     payload = links.get(code) or {}
-#     booking_id = payload.get("booking_id")
-#     record_updated_time = payload.get("recordUpdatedTime")
-#     payment_method = payload.get("payment_method")
-#     if not booking_id or not record_updated_time or not payment_method:
-#         return jsonify({"ok": False, "error": "invalid pay_links entry"}), 400
+    payload = links.get(code) or {}
+    booking_id = payload.get("booking_id")
+    record_updated_time = payload.get("recordUpdatedTime")
+    payment_method = payload.get("payment_method")
+    if not booking_id or not record_updated_time or not payment_method:
+        return jsonify({"ok": False, "error": "invalid pay_links entry"}), 400
 
-#     body = {
-#         "booking_id": booking_id,
-#         "payment_method": payment_method,
-#         "recordUpdatedTime": record_updated_time,
-#     }
+    body = {
+        "booking_id": booking_id,
+        "payment_method": payment_method,
+        "recordUpdatedTime": record_updated_time,
+    }
 
-#     url = f"{CRUISE_BACKEND_BASE}/customers/v2/booking/payment/{booking_id}"
-#     r = requests.post(url, headers=_cruise_payment_headers(access_token), json=body, timeout=20)
-#     r.raise_for_status()
-#     data = r.json() or {}
-#     cs = (data.get("cybersource_response") or {})
-#     endpoint = cs.get("endPoint")
-#     config = cs.get("config") or {}
+    url = f"{CRUISE_BACKEND_BASE}/customers/v2/booking/payment/{booking_id}"
+    r = requests.post(url, headers=_cruise_payment_headers(access_token), json=body, timeout=20)
+    r.raise_for_status()
+    data = r.json() or {}
+    cs = (data.get("cybersource_response") or {})
+    endpoint = cs.get("endPoint")
+    config = cs.get("config") or {}
 
-#     if not endpoint or not isinstance(config, dict) or not config:
-#         return jsonify({"ok": False, "error": "missing cybersource response"}), 502
+    if not endpoint or not isinstance(config, dict) or not config:
+        return jsonify({"ok": False, "error": "missing cybersource response"}), 502
 
-#     html_page = _build_auto_post_form(endpoint, config)
-#     return html_page, 200, {"Content-Type": "text/html; charset=utf-8"}
+    html_page = _build_auto_post_form(endpoint, config)
+    return html_page, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+@app.post("/cruise/paylink/create")
+def cruise_paylink_create():
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        booking_id = int(data.get("booking_id"))
+    except Exception:
+        booking_id = 0
+    if booking_id <= 0:
+        return jsonify({"ok": False, "error": "invalid booking_id"}), 400
+
+    record_updated_time = data.get("recordUpdatedTime")
+    if not isinstance(record_updated_time, str) or not record_updated_time.strip():
+        return jsonify({"ok": False, "error": "invalid recordUpdatedTime"}), 400
+
+    payment_method = data.get("payment_method")
+    if not isinstance(payment_method, list) or not payment_method:
+        return jsonify({"ok": False, "error": "invalid payment_method"}), 400
+    for item in payment_method:
+        if not isinstance(item, dict):
+            return jsonify({"ok": False, "error": "invalid payment_method item"}), 400
+        if not item.get("payment_for") or not item.get("payment_method"):
+            return jsonify({"ok": False, "error": "missing payment_for/payment_method"}), 400
+
+    ttl_seconds = data.get("ttl_seconds", 600)
+    try:
+        ttl_seconds = int(ttl_seconds)
+    except Exception:
+        ttl_seconds = 600
+    if ttl_seconds < 60:
+        ttl_seconds = 60
+    if ttl_seconds > 3600:
+        ttl_seconds = 3600
+
+    now = int(time.time())
+    expires_at = now + ttl_seconds
+
+    lock = FileLock(PAY_LINKS_LOCK)
+    with lock:
+        links = read_json_utf8sig(PAY_LINKS_FILE, {})
+        if not isinstance(links, dict):
+            links = {}
+
+        code = None
+        for _ in range(5):
+            candidate = secrets.token_urlsafe(8)
+            if candidate not in links:
+                code = candidate
+                break
+        if not code:
+            return jsonify({"ok": False, "error": "failed to generate code"}), 500
+
+        links[code] = {
+            "booking_id": booking_id,
+            "recordUpdatedTime": record_updated_time,
+            "payment_method": payment_method,
+            "created_at": now,
+            "expires_at": expires_at,
+            "used_at": 0,
+        }
+        write_json_atomic(PAY_LINKS_FILE, links)
+
+    proto = request.headers.get("X-Forwarded-Proto")
+    host = request.headers.get("X-Forwarded-Host")
+    if proto and host:
+        base_url = f"{proto}://{host}"
+    else:
+        base_url = request.host_url.rstrip("/")
+    pay_url = f"{base_url}/cruise/pay/{code}"
+
+    return jsonify({"ok": True, "code": code, "pay_url": pay_url, "expires_at": expires_at})
 
 @app.post("/cruise/notify")
 def cruise_notify():
@@ -272,6 +345,19 @@ def write_json_atomic(path: str, data):
     except Exception as e:
         print(f"[{ts()}] \u26a0\ufe0f \u5beb\u5165 {path} \u5931\u6557:{type(e).__name__}: {e}")
 
+
+def read_json_utf8sig(path: str, default):
+    try:
+        if not os.path.exists(path):
+            return default
+        with open(path, "r", encoding="utf-8-sig") as f:
+            content = f.read().strip()
+        if not content:
+            return default
+        return json.loads(content)
+    except Exception as e:
+        print(f"[{ts()}] \u26a0\ufe0f \u8b80\u53d6 {path} \u5931\u6557：{type(e).__name__}: {e}")
+        return default
 
 
 def load_features() -> dict:
