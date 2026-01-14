@@ -3,6 +3,7 @@ from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from flask import Flask, request, jsonify
+import html
 
 import os
 import sys
@@ -45,6 +46,10 @@ MONITORS_FILE = "monitors.json"
 TOKENS_CACHE_FILE = "latest_tokens.json"
 FEATURES_FILE = "features.json"
 CRUISE_MONITORS_FILE = "monitors_cruise.json"
+STATE_DIR = "state"
+os.makedirs(STATE_DIR, exist_ok=True)
+PAY_LINKS_FILE = os.path.join(STATE_DIR, "pay_links.json")
+PAY_LINKS_LOCK = os.path.join(STATE_DIR, "pay_links.json.lock")
 CRUISE_BACKEND_BASE = "https://backend-prd.b2m.stardreamcruises.com"
 
 _latest_recaptcha = {"token": None, "at": None, "action": None}
@@ -78,6 +83,48 @@ def cruise_tokens():
 @app.get("/cruise/tokens")
 def cruise_tokens_get():
     return jsonify(_latest_tokens)
+
+
+# @app.get("/cruise/pay/<code>")
+# def cruise_pay(code: str):
+#     if not os.path.exists(PAY_LINKS_FILE):
+#         return jsonify({"ok": False, "error": f"pay_links not found: {PAY_LINKS_FILE}"}), 404
+#     lock = FileLock(PAY_LINKS_LOCK)
+#     with lock:
+#         links = read_json(PAY_LINKS_FILE, {})
+#     if not isinstance(links, dict) or code not in links:
+#         return jsonify({"ok": False, "error": f"unknown code: {code}"}), 404
+
+#     access_token = get_latest_access_token()
+#     if not access_token:
+#         return "No access token found. Please login and sync tokens first.", 500
+
+#     payload = links.get(code) or {}
+#     booking_id = payload.get("booking_id")
+#     record_updated_time = payload.get("recordUpdatedTime")
+#     payment_method = payload.get("payment_method")
+#     if not booking_id or not record_updated_time or not payment_method:
+#         return jsonify({"ok": False, "error": "invalid pay_links entry"}), 400
+
+#     body = {
+#         "booking_id": booking_id,
+#         "payment_method": payment_method,
+#         "recordUpdatedTime": record_updated_time,
+#     }
+
+#     url = f"{CRUISE_BACKEND_BASE}/customers/v2/booking/payment/{booking_id}"
+#     r = requests.post(url, headers=_cruise_payment_headers(access_token), json=body, timeout=20)
+#     r.raise_for_status()
+#     data = r.json() or {}
+#     cs = (data.get("cybersource_response") or {})
+#     endpoint = cs.get("endPoint")
+#     config = cs.get("config") or {}
+
+#     if not endpoint or not isinstance(config, dict) or not config:
+#         return jsonify({"ok": False, "error": "missing cybersource response"}), 502
+
+#     html_page = _build_auto_post_form(endpoint, config)
+#     return html_page, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 @app.post("/cruise/notify")
 def cruise_notify():
@@ -196,7 +243,7 @@ def read_json(path: str, default):
     try:
         if not os.path.exists(path):
             return default
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8-sig") as f:
             content = f.read().strip()
         if not content:
             return default
@@ -214,6 +261,17 @@ def write_json(path: str, data):
         os.replace(tmp_path, path)
     except Exception as e:
         print(f"[{ts()}] ⚠️ 寫入 {path} 失敗：{e}")
+
+
+def write_json_atomic(path: str, data):
+    try:
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, path)
+    except Exception as e:
+        print(f"[{ts()}] \u26a0\ufe0f \u5beb\u5165 {path} \u5931\u6557:{type(e).__name__}: {e}")
+
 
 
 def load_features() -> dict:
@@ -260,6 +318,46 @@ def set_feature(name: str, enabled: bool) -> bool:
         print(f"[{ts()}] ⚠️ 更新 {FEATURES_FILE} 失敗：{e}")
         return False
 
+
+def get_latest_access_token():
+    access = _latest_tokens.get("accessToken")
+    if access:
+        return access
+    cached = read_json(TOKENS_CACHE_FILE, {})
+    if isinstance(cached, dict):
+        return cached.get("accessToken") or cached.get("at")
+    return None
+
+
+def _cruise_payment_headers(access_token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "timezone": "Asia/Taipei",
+        "Origin": "https://sdr.stardreamcruises.com",
+        "Referer": "https://sdr.stardreamcruises.com/",
+    }
+
+
+def _build_auto_post_form(endpoint: str, config: dict) -> str:
+    inputs = []
+    for k, v in sorted(config.items()):
+        name = html.escape(str(k), quote=True)
+        value = html.escape(str(v), quote=True)
+        inputs.append(f'<input type="hidden" name="{name}" value="{value}">')
+    inputs_html = "\n  ".join(inputs)
+    action = html.escape(endpoint, quote=True)
+    return (
+        "<!doctype html>\n"
+        "<html><head><meta charset=\"utf-8\"><title>Redirecting...</title></head>\n"
+        "<body>\n"
+        "  <form id=\"pay\" method=\"POST\" action=\"{action}\">\n"
+        "  {inputs}\n"
+        "  </form>\n"
+        "  <script>document.getElementById('pay').submit();</script>\n"
+        "</body></html>\n"
+    ).format(action=action, inputs=inputs_html)
 
 #
 _latest_tokens.update(read_json(TOKENS_CACHE_FILE, _latest_tokens))
