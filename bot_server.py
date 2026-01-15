@@ -38,6 +38,7 @@ costco_handler = WebhookHandler(COSTCO_CHANNEL_SECRET)
 # Cruise
 CRUISE_TOKEN = os.getenv("LINE_CRUISE_CHANNEL_ACCESS_TOKEN")
 CRUISE_SECRET = os.getenv("LINE_CRUISE_CHANNEL_SECRET")
+CRUISE_ADMIN_KEY = os.getenv("CRUISE_ADMIN_KEY")
 
 cruise_line_bot_api = LineBotApi(CRUISE_TOKEN)
 cruise_handler = WebhookHandler(CRUISE_SECRET)
@@ -52,6 +53,7 @@ STATE_DIR = "state"
 os.makedirs(STATE_DIR, exist_ok=True)
 PAY_LINKS_FILE = os.path.join(STATE_DIR, "pay_links.json")
 PAY_LINKS_LOCK = os.path.join(STATE_DIR, "pay_links.json.lock")
+CRUISE_ADMINS_FILE = os.path.join(STATE_DIR, "cruise_admins.json")
 CRUISE_BACKEND_BASE = "https://backend-prd.b2m.stardreamcruises.com"
 
 _latest_recaptcha = {"token": None, "at": None, "action": None}
@@ -143,6 +145,90 @@ def cruise_pay(code: str):
         if not booking_id or not record_updated_time or not payment_method:
             return jsonify({"ok": False, "error": "invalid pay_links entry"}), 400
 
+        method_map = {
+            "credit_card": "Credit Card",
+            "rwcc_points": "RWCC Points",
+            "genting_points": "Genting Points",
+        }
+        payment_for_map = {
+            "port_charge": "Port Charge",
+            "non_member_surcharge": "Non Member Surcharge",
+        }
+        allowed_methods = set(method_map.values())
+        allowed_payment_for = set(payment_for_map.values())
+
+        def normalize_method(value):
+            if value in method_map:
+                return method_map[value]
+            if value in allowed_methods:
+                return value
+            return None
+
+        def normalize_payment_for(value):
+            if value in payment_for_map:
+                return payment_for_map[value]
+            if value in allowed_payment_for:
+                return value
+            return None
+
+        raw_items = payment_method
+        if isinstance(raw_items, str):
+            raw_items = [{"payment_method": raw_items}]
+        elif isinstance(raw_items, dict):
+            raw_items = [raw_items]
+        if not isinstance(raw_items, list) or not raw_items:
+            return jsonify({"ok": False, "error": "invalid payment_method"}), 400
+
+        normalized_items = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            raw_for = item.get("payment_for") or "Port Charge"
+            raw_method = item.get("payment_method")
+            mapped_method = normalize_method(raw_method)
+            if isinstance(raw_for, list):
+                for pf in raw_for:
+                    mapped_for = normalize_payment_for(pf)
+                    if not mapped_for or not mapped_method:
+                        print(
+                            f"[{ts()}] [CRUISE] invalid payment mapping: "
+                            f"payment_for={raw_for} -> {mapped_for}, "
+                            f"payment_method={raw_method} -> {mapped_method}",
+                            flush=True,
+                        )
+                        return jsonify({
+                            "ok": False,
+                            "error": "invalid payment enum",
+                            "allowed_payment_for": sorted(allowed_payment_for),
+                            "allowed_payment_method": sorted(allowed_methods),
+                        }), 400
+                    normalized_items.append({
+                        "payment_for": mapped_for,
+                        "payment_method": mapped_method,
+                    })
+            else:
+                mapped_for = normalize_payment_for(raw_for)
+                if not mapped_for or not mapped_method:
+                    print(
+                        f"[{ts()}] [CRUISE] invalid payment mapping: "
+                        f"payment_for={raw_for} -> {mapped_for}, "
+                        f"payment_method={raw_method} -> {mapped_method}",
+                        flush=True,
+                    )
+                    return jsonify({
+                        "ok": False,
+                        "error": "invalid payment enum",
+                        "allowed_payment_for": sorted(allowed_payment_for),
+                        "allowed_payment_method": sorted(allowed_methods),
+                    }), 400
+                normalized_items.append({
+                    "payment_for": mapped_for,
+                    "payment_method": mapped_method,
+                })
+
+        if not normalized_items:
+            return jsonify({"ok": False, "error": "invalid payment_method"}), 400
+
         # Mark used before calling payment API to prevent replay
         entry["used_at"] = now
         links[code] = entry
@@ -154,7 +240,7 @@ def cruise_pay(code: str):
 
     body = {
         "booking_id": booking_id,
-        "payment_method": payment_method,
+        "payment_method": normalized_items,
         "recordUpdatedTime": record_updated_time,
     }
 
@@ -241,51 +327,14 @@ def cruise_paylink_create():
         if not item.get("payment_for") or not item.get("payment_method"):
             return jsonify({"ok": False, "error": "missing payment_for/payment_method"}), 400
 
-    ttl_seconds = data.get("ttl_seconds", 600)
-    try:
-        ttl_seconds = int(ttl_seconds)
-    except Exception:
-        ttl_seconds = 600
-    if ttl_seconds < 60:
-        ttl_seconds = 60
-    if ttl_seconds > 3600:
-        ttl_seconds = 3600
+    ttl_seconds = _normalize_ttl_seconds(data.get("ttl_seconds", 600))
+    result = create_paylink_entry(booking_id, record_updated_time, payment_method, ttl_seconds)
+    if not result:
+        return jsonify({"ok": False, "error": "failed to generate code"}), 500
 
-    now = int(time.time())
-    expires_at = now + ttl_seconds
-
-    lock = FileLock(PAY_LINKS_LOCK)
-    with lock:
-        links = read_json(PAY_LINKS_FILE, {})
-        if not isinstance(links, dict):
-            links = {}
-
-        code = None
-        for _ in range(5):
-            candidate = secrets.token_urlsafe(8)
-            if candidate not in links:
-                code = candidate
-                break
-        if not code:
-            return jsonify({"ok": False, "error": "failed to generate code"}), 500
-
-        links[code] = {
-            "booking_id": booking_id,
-            "recordUpdatedTime": record_updated_time,
-            "payment_method": payment_method,
-            "created_at": now,
-            "expires_at": expires_at,
-            "used_at": 0,
-        }
-        write_json_atomic(PAY_LINKS_FILE, links)
-
-    proto = request.headers.get("X-Forwarded-Proto")
-    host = request.headers.get("X-Forwarded-Host")
-    if proto and host:
-        base_url = f"{proto}://{host}"
-    else:
-        base_url = request.host_url.rstrip("/")
-    pay_url = f"{base_url}/cruise/pay/{code}"
+    code = result["code"]
+    expires_at = result["expires_at"]
+    pay_url = f"{_get_base_url()}/cruise/pay/{code}"
 
     access_token = get_latest_access_token()
     booking_summary = fetch_booking_summary(access_token, booking_id) if access_token else None
@@ -305,6 +354,43 @@ def cruise_paylink_create():
     })
     resp.headers["Content-Type"] = "application/json; charset=utf-8"
     return resp, 200
+
+
+@app.post("/cruise/book-and-paylink")
+def cruise_book_and_paylink():
+    admin_key = CRUISE_ADMIN_KEY or ""
+    if not admin_key:
+        print(f"[{ts()}] [CRUISE][ADMINKEY] rejected reason=disabled", flush=True)
+        resp = jsonify({"ok": False, "error": "API_DISABLED", "message": "book-and-paylink API disabled"})
+        resp.headers["Content-Type"] = "application/json; charset=utf-8"
+        return resp, 503
+    provided_key = request.headers.get("X-CRUISE-ADMIN-KEY")
+    if not provided_key or provided_key != admin_key:
+        print(f"[{ts()}] [CRUISE][ADMINKEY] rejected reason=invalid", flush=True)
+        resp = jsonify({"ok": False, "error": "UNAUTHORIZED", "message": "invalid admin key"})
+        resp.headers["Content-Type"] = "application/json; charset=utf-8"
+        return resp, 401
+
+    data = request.get_json(force=True, silent=True) or {}
+    line_user_id = request.headers.get("X-Line-User-Id") or data.get("line_user_id")
+    if not line_user_id:
+        resp = jsonify({"ok": False, "error": "BAD_REQUEST", "message": "missing line_user_id"})
+        resp.headers["Content-Type"] = "application/json; charset=utf-8"
+        return resp, 400
+    if not is_cruise_daemon_enabled():
+        resp = jsonify({"ok": False, "error": "FEATURE_DISABLED", "message": "訂房功能目前未啟用"})
+        resp.headers["Content-Type"] = "application/json; charset=utf-8"
+        return resp, 503
+    if not is_cruise_admin(line_user_id):
+        resp = jsonify({"ok": False, "error": "FORBIDDEN", "message": "你沒有訂房權限（僅限管理者）"})
+        resp.headers["Content-Type"] = "application/json; charset=utf-8"
+        return resp, 403
+
+    trace_id = _make_trace_id()
+    payload, status = _book_and_paylink_flow(data, _get_base_url(), trace_id)
+    resp = jsonify(payload)
+    resp.headers["Content-Type"] = "application/json; charset=utf-8"
+    return resp, status
 
 
 @app.post("/cruise/paylink/notify")
@@ -496,6 +582,47 @@ def load_features() -> dict:
 
 def feature_enabled(name: str) -> bool:
     return bool(FEATURES.get(name, True))
+
+
+def is_cruise_daemon_enabled() -> bool:
+    if not os.path.exists(FEATURES_FILE):
+        print(f"[{ts()}] [CRUISE] features missing: {FEATURES_FILE}", flush=True)
+        return False
+    try:
+        lock = FileLock(FEATURES_FILE + ".lock")
+        with lock:
+            data = read_json(FEATURES_FILE, None)
+    except Exception as e:
+        print(f"[{ts()}] [CRUISE] features read error: {e}", flush=True)
+        return False
+    if not isinstance(data, dict):
+        print(f"[{ts()}] [CRUISE] features parse error", flush=True)
+        return False
+    if "cruise_daemon" not in data:
+        print(f"[{ts()}] [CRUISE] features missing key: cruise_daemon", flush=True)
+        return False
+    if not bool(data.get("cruise_daemon")):
+        print(f"[{ts()}] [CRUISE] features cruise_daemon disabled", flush=True)
+        return False
+    return True
+
+
+def is_cruise_admin(user_id: str) -> bool:
+    if not user_id:
+        return False
+    if not os.path.exists(CRUISE_ADMINS_FILE):
+        print(f"[{ts()}] [CRUISE] admins missing: {CRUISE_ADMINS_FILE}", flush=True)
+        return False
+    try:
+        lock = FileLock(CRUISE_ADMINS_FILE + ".lock")
+        with lock:
+            admins = read_json(CRUISE_ADMINS_FILE, [])
+    except Exception as e:
+        print(f"[{ts()}] [CRUISE] admins read error: {e}", flush=True)
+        return False
+    if not isinstance(admins, list):
+        return False
+    return user_id in admins
 
 
 def set_feature(name: str, enabled: bool) -> bool:
@@ -698,6 +825,12 @@ def build_paylink_summary_text(
     arrival_date = summary.get("arrival_date") or ""
     port_name = summary.get("traditional_chinese_departing_port") or ""
     itinerary_name = summary.get("traditional_chinese_itinerary_name") or ""
+    ship_name = (
+        summary.get("traditional_chinese_ship_name")
+        or summary.get("ship_name")
+        or summary.get("ship_name_zh")
+        or ""
+    )
     cabin_name = summary.get("traditional_chinese_cabin_name") or ""
     pax = summary.get("design_pax") or summary.get("customer_pax")
 
@@ -761,6 +894,10 @@ def build_paylink_summary_text(
             f"日期：{_fmt_field(date_text)}",
             f"出發：{_fmt_field(port_name)}",
             f"航程：{_fmt_field(itinerary_name)}",
+        ]
+        if ship_name:
+            lines.append(f"船名：{_fmt_field(ship_name)}")
+        lines.extend([
             f"房型：{_fmt_field(cabin_name)}",
             f"人數：{_fmt_field(pax)}",
             f"金額：TWD {_fmt_field(amount)}",
@@ -769,7 +906,7 @@ def build_paylink_summary_text(
             f"- 中文名：{main_zh} / English：{main_en}",
             f"  護照：{main_passport}",
             f"  電話：{main_phone}",
-        ]
+        ])
         lines.append("")
         lines.extend(passenger_lines(max_count, include_companion_details))
         lines.append("")
@@ -803,6 +940,276 @@ def build_paylink_summary_text(
         f"👉 前往付款：{pay_url}",
         f"（連結有效 {ttl_minutes} 分鐘）",
     ])
+
+
+def _normalize_ttl_seconds(value) -> int:
+    try:
+        ttl_seconds = int(value)
+    except Exception:
+        ttl_seconds = 600
+    if ttl_seconds < 60:
+        ttl_seconds = 60
+    if ttl_seconds > 3600:
+        ttl_seconds = 3600
+    return ttl_seconds
+
+
+def _normalize_payment_method(value) -> list | None:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, str) and value.strip():
+        return [{"payment_for": "Port Charge", "payment_method": value.strip()}]
+    return None
+
+
+def _make_trace_id() -> str:
+    return f"{int(time.time())}-{secrets.token_hex(3)}"
+
+
+def _extract_record_updated_time(summary: dict, fallback: str | None) -> str | None:
+    for key in ("recordUpdatedTime", "record_updated_time", "record_updated_at", "updated_at"):
+        value = summary.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    if isinstance(fallback, str) and fallback.strip():
+        return fallback.strip()
+    return None
+
+
+def _is_booking_cancelled(summary: dict) -> bool:
+    for key in ("deleted_at", "cancelled_at", "canceled_at"):
+        if summary.get(key):
+            return True
+    status = (summary.get("status") or summary.get("booking_status") or "").lower()
+    return "cancel" in status
+
+
+def _get_base_url() -> str:
+    proto = request.headers.get("X-Forwarded-Proto")
+    host = request.headers.get("X-Forwarded-Host")
+    if proto and host:
+        return f"{proto}://{host}"
+    return request.host_url.rstrip("/")
+
+
+def create_paylink_entry(
+    booking_id: int,
+    record_updated_time: str,
+    payment_method: list,
+    ttl_seconds: int,
+) -> dict | None:
+    now = int(time.time())
+    expires_at = now + ttl_seconds
+
+    lock = FileLock(PAY_LINKS_LOCK)
+    with lock:
+        links = read_json(PAY_LINKS_FILE, {})
+        if not isinstance(links, dict):
+            links = {}
+
+        code = None
+        for _ in range(5):
+            candidate = secrets.token_urlsafe(8)
+            if candidate not in links:
+                code = candidate
+                break
+        if not code:
+            return None
+
+        links[code] = {
+            "booking_id": booking_id,
+            "recordUpdatedTime": record_updated_time,
+            "payment_method": payment_method,
+            "created_at": now,
+            "expires_at": expires_at,
+            "used_at": 0,
+        }
+        write_json_atomic(PAY_LINKS_FILE, links)
+
+    return {"code": code, "expires_at": expires_at}
+
+
+def _log_backend_response(trace_id: str, label: str, resp: requests.Response):
+    body = ""
+    try:
+        body = resp.text or ""
+    except Exception:
+        body = ""
+    body = body[:500]
+    print(
+        f"[{ts()}] [CRUISE] trace={trace_id} {label} status={resp.status_code} body={body}",
+        flush=True,
+    )
+
+
+def _parse_json_response(resp: requests.Response) -> dict | None:
+    try:
+        data = resp.json()
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _book_and_paylink_flow(data: dict, base_url: str, trace_id: str) -> tuple[dict, int]:
+    access_token = get_latest_access_token()
+    if not access_token:
+        return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
+
+    def to_int(value):
+        try:
+            return int(value)
+        except Exception:
+            return 0
+
+    cabin_allotment_id = to_int(data.get("cabin_allotment_id"))
+    customer_pax = to_int(data.get("customer_pax"))
+    itinerary_id = to_int(data.get("itinerary_id"))
+    non_member_surcharge_id = to_int(data.get("non_member_surcharge_id"))
+    record_updated_time = data.get("record_updated_time")
+
+    missing = []
+    if cabin_allotment_id <= 0:
+        missing.append("cabin_allotment_id")
+    if customer_pax <= 0:
+        missing.append("customer_pax")
+    if itinerary_id <= 0:
+        missing.append("itinerary_id")
+    if non_member_surcharge_id <= 0:
+        missing.append("non_member_surcharge_id")
+    if not isinstance(record_updated_time, str) or not record_updated_time.strip():
+        missing.append("record_updated_time")
+    if missing:
+        return {"ok": False, "error": f"缺少必要欄位: {', '.join(missing)}"}, 400
+
+    payment_method = _normalize_payment_method(data.get("payment_method"))
+    if not payment_method:
+        return {"ok": False, "error": "invalid payment_method"}, 400
+
+    ttl_seconds = _normalize_ttl_seconds(data.get("ttl_seconds", 600))
+    headers = _cruise_payment_headers(access_token)
+
+    draft_payload = {
+        "cabin_allotment_id": cabin_allotment_id,
+        "customer_pax": customer_pax,
+        "gratuity_charge_id": None,
+        "itinerary_id": itinerary_id,
+        "non_member_surcharge_id": non_member_surcharge_id,
+        "record_updated_time": record_updated_time,
+    }
+
+    for attempt in range(2):
+        draft_url = f"{CRUISE_BACKEND_BASE}/customers/v2/booking/draft"
+        try:
+            r = requests.post(draft_url, headers=headers, json=draft_payload, timeout=20)
+        except Exception as ex:
+            print(f"[{ts()}] [CRUISE] trace={trace_id} draft error={type(ex).__name__}", flush=True)
+            return {"ok": False, "error": "後端建立草稿失敗，請稍後重試"}, 502
+        if r.status_code == 401:
+            _log_backend_response(trace_id, "draft", r)
+            return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
+        if r.status_code >= 400:
+            _log_backend_response(trace_id, "draft", r)
+            return {"ok": False, "error": "後端建立草稿失敗，請稍後重試"}, 502
+
+        draft_data = _parse_json_response(r) or {}
+        booking_id = draft_data.get("booking_id")
+        if not booking_id:
+            return {"ok": False, "error": "後端回傳缺少 booking_id"}, 502
+
+        check_url = f"{CRUISE_BACKEND_BASE}/booking/check-status/{booking_id}"
+        try:
+            r = requests.get(check_url, headers=headers, timeout=20)
+        except Exception as ex:
+            print(f"[{ts()}] [CRUISE] trace={trace_id} check-status error={type(ex).__name__}", flush=True)
+            return {"ok": False, "error": "後端查詢訂單狀態失敗，請稍後重試"}, 502
+        if r.status_code == 401:
+            _log_backend_response(trace_id, "check-status", r)
+            return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
+        if r.status_code >= 400:
+            _log_backend_response(trace_id, "check-status", r)
+            return {"ok": False, "error": "後端查詢訂單狀態失敗，請稍後重試"}, 502
+
+        check_data = _parse_json_response(r) or {}
+        numeric_id = check_data.get("id") or check_data.get("booking_id")
+        try:
+            numeric_id = int(numeric_id)
+        except Exception:
+            numeric_id = 0
+        if numeric_id <= 0:
+            return {"ok": False, "error": "後端回傳缺少 numeric_id"}, 502
+
+        booking_url = f"{CRUISE_BACKEND_BASE}/booking/{numeric_id}"
+        try:
+            r = requests.get(booking_url, headers=headers, timeout=20)
+        except Exception as ex:
+            print(f"[{ts()}] [CRUISE] trace={trace_id} booking error={type(ex).__name__}", flush=True)
+            return {"ok": False, "error": "後端查詢訂單詳情失敗，請稍後重試"}, 502
+        if r.status_code == 401:
+            _log_backend_response(trace_id, "booking", r)
+            return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
+        if r.status_code >= 400:
+            _log_backend_response(trace_id, "booking", r)
+            body_text = ""
+            try:
+                body_text = r.text or ""
+            except Exception:
+                body_text = ""
+            if "Order has been cancelled" in body_text:
+                if attempt == 0:
+                    continue
+                return {"ok": False, "error": "訂單已取消，請稍後重試"}, 400
+            return {"ok": False, "error": "後端查詢訂單詳情失敗，請稍後重試"}, 502
+
+        booking_payload = _parse_json_response(r) or {}
+        booking_summary = booking_payload.get("data") if isinstance(booking_payload, dict) else None
+        if booking_summary is None:
+            booking_summary = booking_payload
+        if not isinstance(booking_summary, dict):
+            return {"ok": False, "error": "後端回傳訂單資料格式錯誤"}, 502
+
+        if _is_booking_cancelled(booking_summary):
+            if attempt == 0:
+                continue
+            return {"ok": False, "error": "訂單已取消，請稍後重試"}, 400
+
+        latest_record_updated_time = _extract_record_updated_time(booking_summary, record_updated_time)
+        if not latest_record_updated_time:
+            print(f"[{ts()}] [CRUISE] trace={trace_id} missing recordUpdatedTime", flush=True)
+            return {"ok": False, "error": "後端缺少 recordUpdatedTime"}, 502
+
+        paylink_entry = create_paylink_entry(
+            booking_id=numeric_id,
+            record_updated_time=latest_record_updated_time,
+            payment_method=payment_method,
+            ttl_seconds=ttl_seconds,
+        )
+        if not paylink_entry:
+            return {"ok": False, "error": "failed to generate code"}, 500
+
+        code = paylink_entry["code"]
+        expires_at_epoch = paylink_entry["expires_at"]
+        expires_at_iso = datetime.utcfromtimestamp(expires_at_epoch).strftime("%Y-%m-%dT%H:%M:%SZ")
+        pay_url = f"{base_url}/cruise/pay/{code}"
+        summary_text = build_paylink_summary_text(
+            booking_id=numeric_id,
+            pay_url=pay_url,
+            ttl_seconds=ttl_seconds,
+            booking_summary=booking_summary,
+        )
+
+        return {
+            "ok": True,
+            "booking_id": booking_id,
+            "numeric_id": numeric_id,
+            "summary_text": summary_text,
+            "pay_url": pay_url,
+            "expires_at": expires_at_iso,
+            "code": code,
+        }, 200
+
+    return {"ok": False, "error": "訂單已取消，請稍後重試"}, 400
 
 
 def fetch_itinerary(access_token: str, date: str) -> str | None:
@@ -1241,6 +1648,54 @@ def handle_cruise_message(event):
     if not feature_enabled("cruise_daemon"):
         reply = "Cruise \u529f\u80fd\u76ee\u524d\u505c\u7528"
         cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
+
+    if raw_text.startswith(("\u8a02\u623f", "\u8ba2\u623f")):
+        if not is_cruise_daemon_enabled():
+            reply = "\u8a02\u623f\u529f\u80fd\u76ee\u524d\u672a\u555f\u7528"
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
+        if not is_cruise_admin(event.source.user_id):
+            reply = "\u4f60\u6c92\u6709\u8a02\u623f\u6b0a\u9650\uff08\u50c5\u9650\u7ba1\u7406\u8005\uff09"
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
+        payload_text = raw_text[2:].strip()
+        if not payload_text:
+            reply = (
+                "\u8acb\u7528\uff1a\u8a02\u623f {JSON}\n"
+                "\u4f8b\u5982\uff1a\u8a02\u623f {\"cabin_allotment_id\":31020,"
+                "\"customer_pax\":2,\"itinerary_id\":698,"
+                "\"non_member_surcharge_id\":95,"
+                "\"record_updated_time\":\"2026-01-15T05:57:51Z\","
+                "\"payment_method\":\"credit_card\",\"ttl_seconds\":600}"
+            )
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
+        try:
+            payload = json.loads(payload_text)
+        except Exception:
+            reply = "JSON \u683c\u5f0f\u932f\u8aa4\uff0c\u8acb\u7528\uff1a\u8a02\u623f {JSON}"
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
+        trace_id = _make_trace_id()
+        result, status = _book_and_paylink_flow(payload, _get_base_url(), trace_id)
+        if status != 200 or not result.get("ok"):
+            reply = result.get("error") or "\u8a02\u623f\u5931\u6557\uff0c\u8acb\u7a0d\u5f8c\u91cd\u8a66"
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
+        summary_text = result.get("summary_text") or ""
+        pay_url = result.get("pay_url") or ""
+        expires_at = result.get("expires_at") or ""
+        extra = (
+            f"\ud83d\udc49 \u524d\u5f80\u4ed8\u6b3e\uff1a{pay_url}\n"
+            f"\uff08\u9023\u7d50\u6709\u6548\u81f3 {expires_at}\uff0c\u4e00\u6b21\u6027\uff09"
+            if pay_url
+            else "\u4ed8\u6b3e\u9023\u7d50\u672a\u53d6\u5f97\uff0c\u8acb\u7a0d\u5f8c\u91cd\u8a66"
+        )
+        cruise_line_bot_api.reply_message(
+            event.reply_token,
+            [TextSendMessage(text=summary_text), TextSendMessage(text=extra)],
+        )
         return
 
     list_keywords = ("列出監控", "監控列表", "顯示監控", "列出", "列表","LIST","List","list")
