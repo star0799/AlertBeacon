@@ -287,7 +287,40 @@ def cruise_paylink_create():
         base_url = request.host_url.rstrip("/")
     pay_url = f"{base_url}/cruise/pay/{code}"
 
-    return jsonify({"ok": True, "code": code, "pay_url": pay_url, "expires_at": expires_at})
+    access_token = get_latest_access_token()
+    booking_summary = fetch_booking_summary(access_token, booking_id) if access_token else None
+    summary_text = build_paylink_summary_text(
+        booking_id=booking_id,
+        pay_url=pay_url,
+        ttl_seconds=ttl_seconds,
+        booking_summary=booking_summary,
+    )
+
+    resp = jsonify({
+        "ok": True,
+        "code": code,
+        "pay_url": pay_url,
+        "expires_at": expires_at,
+        "summary_text": summary_text,
+    })
+    resp.headers["Content-Type"] = "application/json; charset=utf-8"
+    return resp, 200
+
+
+@app.post("/cruise/paylink/notify")
+def cruise_paylink_notify():
+    if not feature_enabled("cruise_daemon"):
+        return jsonify({"ok": False, "error": "cruise disabled"}), 503
+    data = request.get_json(force=True, silent=True) or {}
+    target = data.get("to")
+    message = data.get("message")
+    if not target or not message:
+        return jsonify({"ok": False, "error": "missing to/message"}), 400
+    try:
+        cruise_line_bot_api.push_message(target, TextSendMessage(text=message))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True})
 
 @app.post("/cruise/notify")
 def cruise_notify():
@@ -560,6 +593,216 @@ def _cruise_headers(access_token: str) -> dict:
         "Accept": "application/json, text/plain, */*",
         "timezone": "Asia/Taipei",
     }
+
+
+def fetch_booking_summary(access_token: str, booking_id_numeric: int) -> dict | None:
+    url = f"{CRUISE_BACKEND_BASE}/booking/{booking_id_numeric}"
+    try:
+        r = requests.get(url, headers=_cruise_payment_headers(access_token), timeout=10)
+        r.raise_for_status()
+        payload = r.json() or {}
+        if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+            return payload.get("data")
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _fmt_field(value) -> str:
+    if value is None:
+        return "（未提供）"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        text = value.strip()
+        return text if text else "（未提供）"
+    return "（未提供）"
+
+
+def _fmt_amount(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
+        return str(value)
+    if isinstance(value, str):
+        return value.strip()
+    return ""
+
+
+def _full_name(person: dict) -> str:
+    if not isinstance(person, dict):
+        return ""
+    name = (
+        person.get("full_name")
+        or person.get("english_name")
+        or person.get("name_en")
+        or ""
+    )
+    if name:
+        return name
+    given = person.get("given_name") or person.get("first_name") or ""
+    surname = person.get("surname") or person.get("last_name") or ""
+    return " ".join([x for x in [given, surname] if x])
+
+
+def _chinese_name(person: dict) -> str:
+    if not isinstance(person, dict):
+        return ""
+    return (
+        person.get("chinese_name")
+        or person.get("traditional_chinese_name")
+        or person.get("name_zh")
+        or ""
+    )
+
+
+def _phone_number(person: dict) -> str:
+    if not isinstance(person, dict):
+        return ""
+    country = person.get("phone_country_code_number") or person.get("country_code") or ""
+    number = person.get("phone_number") or person.get("phone") or person.get("mobile") or ""
+    if country and number:
+        return f"{country}{number}"
+    return number or country or ""
+
+
+def _extract_passengers(booking_summary: dict) -> list[dict]:
+    for key in ("passenger_list", "passengers", "passengerList"):
+        items = booking_summary.get(key)
+        if isinstance(items, list):
+            return [p for p in items if isinstance(p, dict)]
+    return []
+
+
+def build_paylink_summary_text(
+    booking_id: int,
+    pay_url: str,
+    ttl_seconds: int,
+    booking_summary: dict | None,
+) -> str:
+    ttl_minutes = max(1, int((ttl_seconds + 59) / 60))
+    if not isinstance(booking_summary, dict):
+        return "\n".join([
+            "🧾【付款前二次確認】",
+            f"訂單：{booking_id}",
+            f"👉 前往付款：{pay_url}",
+            f"（連結有效 {ttl_minutes} 分鐘）",
+        ])
+
+    summary = booking_summary
+    booking_id_inner = summary.get("booking_id") or ""
+    order_id = summary.get("id") or booking_id
+    departure_date = summary.get("departure_date") or ""
+    arrival_date = summary.get("arrival_date") or ""
+    port_name = summary.get("traditional_chinese_departing_port") or ""
+    itinerary_name = summary.get("traditional_chinese_itinerary_name") or ""
+    cabin_name = summary.get("traditional_chinese_cabin_name") or ""
+    pax = summary.get("design_pax") or summary.get("customer_pax")
+
+    amount = ""
+    pcm = summary.get("port_charge_mode")
+    if isinstance(pcm, dict):
+        amount = _fmt_amount(pcm.get("credit_card"))
+    if not amount:
+        amount = _fmt_amount(summary.get("credit_card"))
+
+    main = summary.get("main_passenger") if isinstance(summary.get("main_passenger"), dict) else {}
+    main_zh = _fmt_field(_chinese_name(main))
+    main_en = _fmt_field(_full_name(main))
+    main_passport = _fmt_field(main.get("passport_number") or main.get("passport"))
+    main_phone = _fmt_field(_phone_number(main))
+
+    emergency = summary.get("emergency_contact") if isinstance(summary.get("emergency_contact"), dict) else {}
+    emergency_zh = _fmt_field(_chinese_name(emergency)) if emergency else ""
+    emergency_en = _fmt_field(_full_name(emergency)) if emergency else ""
+    emergency_phone = _fmt_field(_phone_number(emergency)) if emergency else ""
+    emergency_rel = _fmt_field(emergency.get("relationship_type") or emergency.get("relationship")) if emergency else ""
+
+    passengers = _extract_passengers(summary)
+    passengers_available = bool(passengers)
+
+    def passenger_lines(max_count: int, include_details: bool) -> list[str]:
+        lines = ["同行乘客："]
+        if not passengers_available:
+            lines.append("（後端未回傳/尚未完成）")
+            return lines
+        for idx, p in enumerate(passengers[:max_count], 1):
+            zh = _fmt_field(_chinese_name(p))
+            en = _fmt_field(_full_name(p))
+            lines.append(f"- 中文名：{zh} / English：{en}")
+            if include_details:
+                passport = _fmt_field(p.get("passport_number") or p.get("passport"))
+                phone = _fmt_field(_phone_number(p))
+                lines.append(f"  護照：{passport}")
+                lines.append(f"  電話：{phone}")
+        if len(passengers) > max_count:
+            lines.append("...其餘略")
+        return lines
+
+    def emergency_lines(include_details: bool) -> list[str]:
+        lines = ["緊急聯絡人："]
+        if not emergency:
+            lines.append("（未提供）")
+            return lines
+        lines.append(f"- 中文名：{emergency_zh} / English：{emergency_en}")
+        if include_details:
+            lines.append(f"  電話：{emergency_phone}")
+            if emergency_rel != "（未提供）":
+                lines.append(f"  關係：{emergency_rel}")
+        return lines
+
+    def assemble(max_count: int, include_companion_details: bool, include_emergency_details: bool) -> str:
+        date_text = departure_date if not arrival_date else f"{departure_date} ～ {arrival_date}"
+        lines = [
+            "🧾【付款前二次確認】",
+            f"訂單：{_fmt_field(order_id)}（booking_id: {_fmt_field(booking_id_inner)}）",
+            f"日期：{_fmt_field(date_text)}",
+            f"出發：{_fmt_field(port_name)}",
+            f"航程：{_fmt_field(itinerary_name)}",
+            f"房型：{_fmt_field(cabin_name)}",
+            f"人數：{_fmt_field(pax)}",
+            f"金額：TWD {_fmt_field(amount)}",
+            "",
+            "主要乘客：",
+            f"- 中文名：{main_zh} / English：{main_en}",
+            f"  護照：{main_passport}",
+            f"  電話：{main_phone}",
+        ]
+        lines.append("")
+        lines.extend(passenger_lines(max_count, include_companion_details))
+        lines.append("")
+        lines.extend(emergency_lines(include_emergency_details))
+        lines.append("")
+        lines.append(f"👉 前往付款：{pay_url}")
+        lines.append(f"（連結有效 {ttl_minutes} 分鐘）")
+        return "\n".join(lines).strip()
+
+    max_count = min(len(passengers), 6) if passengers_available else 0
+    include_companion_details = True
+    include_emergency_details = True
+    for _ in range(8):
+        text = assemble(max_count, include_companion_details, include_emergency_details)
+        if len(text) <= 2000:
+            return text
+        if max_count > 1:
+            max_count -= 1
+            continue
+        if include_companion_details:
+            include_companion_details = False
+            continue
+        if include_emergency_details:
+            include_emergency_details = False
+            continue
+        break
+
+    return "\n".join([
+        "🧾【付款前二次確認】",
+        f"訂單：{booking_id}",
+        f"👉 前往付款：{pay_url}",
+        f"（連結有效 {ttl_minutes} 分鐘）",
+    ])
 
 
 def fetch_itinerary(access_token: str, date: str) -> str | None:
