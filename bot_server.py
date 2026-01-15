@@ -54,6 +54,7 @@ os.makedirs(STATE_DIR, exist_ok=True)
 PAY_LINKS_FILE = os.path.join(STATE_DIR, "pay_links.json")
 PAY_LINKS_LOCK = os.path.join(STATE_DIR, "pay_links.json.lock")
 CRUISE_ADMINS_FILE = os.path.join(STATE_DIR, "cruise_admins.json")
+PRIVATE_PEOPLE_FILE = os.path.join(STATE_DIR, "private_people.json")
 CRUISE_BACKEND_BASE = "https://backend-prd.b2m.stardreamcruises.com"
 
 _latest_recaptcha = {"token": None, "at": None, "action": None}
@@ -1212,6 +1213,569 @@ def _book_and_paylink_flow(data: dict, base_url: str, trace_id: str) -> tuple[di
     return {"ok": False, "error": "訂單已取消，請稍後重試"}, 400
 
 
+def _parse_flexible_date(text: str) -> str | None:
+    m = re.match(r"^(\d{4})[-/\.]?(\d{1,2})[-/\.]?(\d{1,2})$", text)
+    if not m:
+        return None
+    y, mo, d = (int(v) for v in m.groups())
+    try:
+        return datetime(y, mo, d).strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def _parse_tier(text: str) -> int | None:
+    if text in ("\u5167\u5074", "\u5167\u8259"):
+        return 1
+    if text == "\u6d77\u666f":
+        return 2
+    if text in ("\u9732\u53f0", "\u9732\u81fa", "\u967d\u53f0"):
+        return 3
+    return None
+
+
+def _normalize_alias(text: str) -> str:
+    return (text or "").strip().upper()
+
+
+def _load_private_people() -> tuple[list, list]:
+    data = read_json(PRIVATE_PEOPLE_FILE, {})
+    if not isinstance(data, dict):
+        return [], []
+    people = data.get("people") if isinstance(data.get("people"), list) else []
+    emergencies = data.get("emergencies") if isinstance(data.get("emergencies"), list) else []
+    return people, emergencies
+
+
+def _match_alias(token: str, entries: list) -> dict | None:
+    needle = _normalize_alias(token)
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        aliases = item.get("aliases") or []
+        if not isinstance(aliases, list):
+            continue
+        for a in aliases:
+            if _normalize_alias(a) == needle:
+                return item
+    return None
+
+
+def _fetch_fc_list(access_token: str) -> list:
+    url = f"{CRUISE_BACKEND_BASE}/frequent-cruisers-customer"
+    r = requests.get(url, headers=_cruise_payment_headers(access_token), timeout=20)
+    if r.status_code == 401:
+        raise PermissionError("fc unauthorized")
+    r.raise_for_status()
+    payload = r.json() or {}
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    return []
+
+
+def _match_fc_person(fc_list: list, fc_match: dict) -> dict | None:
+    if not isinstance(fc_match, dict):
+        return None
+    passport = fc_match.get("passport_number")
+    given = fc_match.get("given_name")
+    surname = fc_match.get("surname")
+    chinese = fc_match.get("chinese_name")
+    for p in fc_list:
+        if passport and p.get("passport_number") == passport:
+            return p
+    for p in fc_list:
+        if chinese and p.get("chinese_name") == chinese:
+            return p
+        if given and surname and p.get("given_name") == given and p.get("surname") == surname:
+            return p
+    return None
+
+
+def _merge_dict(base: dict, override: dict) -> dict:
+    merged = dict(base or {})
+    for k, v in (override or {}).items():
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        merged[k] = v
+    return merged
+
+
+def _map_fc_to_passenger(fc: dict) -> dict:
+    if not isinstance(fc, dict):
+        return {}
+    return {
+        "first_name": fc.get("given_name") or "",
+        "last_name": fc.get("surname") or "",
+        "chinese_name": fc.get("chinese_name") or "",
+        "date_of_birth": fc.get("date_of_birth") or "",
+        "gender": fc.get("gender") or "",
+        "nationality": fc.get("nationality") or "",
+        "passport_issuance_country": fc.get("passport_issuance_country") or "",
+        "passport_number": fc.get("passport_number") or "",
+        "passport_issuance_date": fc.get("passport_issuance_date") or "",
+        "passport_expiry_date": fc.get("passport_expiry_date") or "",
+    }
+
+
+def _normalize_gender(value: str) -> str:
+    if not isinstance(value, str):
+        return value
+    v = value.strip().lower()
+    if v in ("m", "male"):
+        return "male"
+    if v in ("f", "female"):
+        return "female"
+    return value
+
+
+def _normalize_phone_digits(value: str) -> str:
+    if not isinstance(value, str):
+        return value
+    return re.sub(r"[^\d]", "", value)
+
+
+def _validate_mmid(access_token: str, mmid: str, booking_id: int, record_updated_time: str) -> tuple[bool, dict | str]:
+    url = f"{CRUISE_BACKEND_BASE}/customers/v2/validate-mmid"
+    payload = {"mmid": [mmid], "fc_ids": [], "id": booking_id, "recordUpdatedTime": record_updated_time}
+    r = requests.post(url, headers=_cruise_payment_headers(access_token), json=payload, timeout=20)
+    if r.status_code == 401:
+        return False, "Token 已過期，請重新登入 SDC 後再試"
+    if r.status_code >= 400:
+        return False, f"validate-mmid failed ({r.status_code})"
+    data = r.json() or {}
+    if isinstance(data, dict) and (data.get("status_code") or data.get("messages")):
+        msg = data.get("messages") or data.get("message") or "validate-mmid failed"
+        return False, msg
+    return True, data if isinstance(data, dict) else {}
+
+
+def _require_fields(passenger: dict, label: str) -> list:
+    required = [
+        "first_name",
+        "last_name",
+        "date_of_birth",
+        "gender",
+        "nationality",
+        "passport_issuance_country",
+        "passport_number",
+        "passport_issuance_date",
+        "passport_expiry_date",
+        "email",
+        "re-email",
+        "phone_country_code",
+        "phone_number",
+    ]
+    missing = []
+    for key in required:
+        v = passenger.get(key)
+        if not v or (isinstance(v, str) and not v.strip()):
+            missing.append(f"{label}:{key}")
+    return missing
+
+
+def _require_emergency_fields(emergency: dict) -> list:
+    required = [
+        "given_name",
+        "surname",
+        "relationship_type",
+        "phone_country_code",
+        "phone_country_code_number",
+        "phone_number",
+        "email",
+    ]
+    missing = []
+    for key in required:
+        v = emergency.get(key)
+        if not v or (isinstance(v, str) and not v.strip()):
+            missing.append(f"\u7dca\u6025\u806f\u7d61\u4eba:{key}")
+    return missing
+
+
+def _resolve_allotment(access_token: str, date: str, tier: int, pax: int) -> tuple[dict | None, str | None]:
+    itinerary_name = fetch_itinerary(access_token, date)
+    if not itinerary_name:
+        return None, "\u8a72\u65e5\u671f\u6c92\u6709\u63a2\u7d22\u661f\u865f\u822a\u7a0b"
+    port_info = fetch_port(access_token, date)
+    if not port_info or port_info.get("departure_port") is None:
+        return None, "\u67e5\u7121\u53ef\u7528\u51fa\u767c\u6e2f\u53e3"
+
+    params = {
+        "itinerary_name": itinerary_name,
+        "departure_date": date,
+        "departure_port": str(port_info.get("departure_port")),
+        "pax": str(pax),
+        "lang": "hant",
+    }
+    try:
+        r = requests.get(
+            f"{CRUISE_BACKEND_BASE}/customers/cabin-allotment",
+            params=params,
+            headers=_cruise_payment_headers(access_token),
+            timeout=20,
+        )
+    except Exception:
+        return None, "\u67e5\u8a62\u623f\u578b\u5931\u6557\uff0c\u8acb\u7a0d\u5f8c\u518d\u8a66"
+    if r.status_code == 401:
+        return None, "Token \u5df2\u904e\u671f\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66"
+    try:
+        r.raise_for_status()
+    except Exception:
+        return None, "\u67e5\u8a62\u623f\u578b\u5931\u6557\uff0c\u8acb\u7a0d\u5f8c\u518d\u8a66"
+    data = r.json() or {}
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        items = []
+
+    tier_keywords = {
+        3: ["balcony", "terrace", "balcony cabin", "\u9732\u53f0", "\u967d\u53f0"],
+        2: ["oceanview", "ocean view", "\u6d77\u666f"],
+        1: ["interior", "\u5167\u5074", "\u5167\u8259"],
+    }
+    keywords = tier_keywords.get(tier, [])
+
+    def pick_item():
+        for it in items:
+            name = (it.get("cabin_name") or it.get("cabin_category_name") or "").lower()
+            for kw in keywords:
+                if kw.lower() in name:
+                    return it
+        return items[0] if items else None
+
+    picked = pick_item()
+    if not picked:
+        return None, "\u67e5\u7121\u53ef\u7528\u623f\u578b"
+
+    result = {
+        "cabin_allotment_id": picked.get("cabin_allotment_id") or picked.get("id"),
+        "itinerary_id": picked.get("itinerary_id") or picked.get("itineraryId"),
+        "non_member_surcharge_id": picked.get("non_member_surcharge_id") or picked.get("nonMemberSurchargeId"),
+        "record_updated_time": picked.get("recordUpdatedTime") or picked.get("record_updated_time") or data.get("recordUpdatedTime"),
+        "itinerary_name": itinerary_name,
+        "port_name": port_info.get("port_name") or "",
+    }
+    if not result["cabin_allotment_id"] or not result["itinerary_id"] or not result["non_member_surcharge_id"]:
+        return None, "\u7121\u6cd5\u53d6\u5f97\u8a02\u623f\u53c3\u6578\uff0c\u8acb\u7a0d\u5f8c\u91cd\u8a66"
+    return result, None
+
+
+def _build_booking_payload(
+    numeric_id: int,
+    cabin_allotment_id: int,
+    customer_pax: int,
+    record_updated_time: str,
+    main_passenger: dict,
+    passengers: list,
+    emergency_contact: dict,
+) -> dict:
+    return {
+        "id": numeric_id,
+        "cabin_allotment_id": cabin_allotment_id,
+        "customer_pax": customer_pax,
+        "recordUpdatedTime": record_updated_time,
+        "email": main_passenger.get("email"),
+        "given_name": main_passenger.get("first_name"),
+        "surname": main_passenger.get("last_name"),
+        "emergency_contact": emergency_contact,
+        "main_passenger": main_passenger,
+        "passenger_list": passengers,
+    }
+
+
+def _format_passenger_details(passenger: dict) -> str:
+    return "\n".join([
+        f"\u4e2d\u6587\u540d\uff1a{passenger.get('chinese_name') or ''}",
+        f"English\uff1a{passenger.get('first_name')} {passenger.get('last_name')}",
+        f"\u8b77\u7167\uff1a{passenger.get('passport_number')} / {passenger.get('passport_issuance_date')} / {passenger.get('passport_expiry_date')}",
+        f"\u767c\u7167\u5730\uff1a{passenger.get('passport_issuance_country')}",
+        f"\u751f\u65e5\uff1a{passenger.get('date_of_birth')}  \u6027\u5225\uff1a{passenger.get('gender')}",
+        f"Email\uff1a{passenger.get('email')} / {passenger.get('re-email')}",
+        f"\u96fb\u8a71\uff1a{passenger.get('phone_country_code')} {passenger.get('phone_number')}",
+    ])
+
+
+def _format_emergency_details(emergency: dict) -> str:
+    return "\n".join([
+        f"\u4e2d\u6587\u540d\uff1a{emergency.get('chinese_name') or ''}",
+        f"English\uff1a{emergency.get('given_name')} {emergency.get('surname')}",
+        f"\u95dc\u4fc2\uff1a{emergency.get('relationship_type')}",
+        f"\u96fb\u8a71\uff1a{emergency.get('phone_country_code')} +{emergency.get('phone_country_code_number')} {emergency.get('phone_number')}",
+        f"Email\uff1a{emergency.get('email')}",
+    ])
+
+
+def _split_line_messages(text: str, limit: int = 1800) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+    parts = []
+    buf = []
+    count = 0
+    for line in text.splitlines():
+        if count + len(line) + 1 > limit and buf:
+            parts.append("\n".join(buf))
+            buf = [line]
+            count = len(line) + 1
+        else:
+            buf.append(line)
+            count += len(line) + 1
+    if buf:
+        parts.append("\n".join(buf))
+    return parts
+
+
+def _resolve_passengers_and_emergency(
+    access_token: str,
+    numeric_id: int,
+    record_updated_time: str,
+    names: list[str],
+) -> tuple[dict | None, list | None, dict | None, str | None]:
+    people, emergencies = _load_private_people()
+    fc_list = _fetch_fc_list(access_token)
+
+    main_token = names[0]
+    companion_tokens = names[1:-1]
+    emergency_token = names[-1]
+
+    def build_passenger(token: str, label: str) -> tuple[dict | None, str | None]:
+        entry = _match_alias(token, people)
+        if not entry:
+            return None, f"\u627e\u4e0d\u5230\u4e58\u5ba2\u8cc7\u6599\uff1a{label}({token})"
+        passenger = entry.get("passenger") if isinstance(entry.get("passenger"), dict) else {}
+        overrides = entry.get("passenger_overrides") if isinstance(entry.get("passenger_overrides"), dict) else {}
+        fc_match = entry.get("fc_match") if isinstance(entry.get("fc_match"), dict) else None
+        is_member = bool(entry.get("is_member"))
+        mmid = entry.get("mmid") if is_member else None
+
+        base = dict(passenger)
+        if fc_match:
+            fc_person = _match_fc_person(fc_list, fc_match)
+            if fc_person:
+                base = _merge_dict(_map_fc_to_passenger(fc_person), base)
+        base = _merge_dict(base, overrides)
+
+        if is_member and mmid:
+            ok, result = _validate_mmid(access_token, mmid, numeric_id, record_updated_time)
+            if not ok:
+                return None, f"\u6703\u54e1\u9a57\u8b49\u5931\u6557\uff1a{mmid} {result}"
+            if isinstance(result, dict):
+                base = _merge_dict(base, {
+                    "date_of_birth": result.get("dob") or base.get("date_of_birth"),
+                    "gender": result.get("gender") or base.get("gender"),
+                    "email": result.get("email") or base.get("email"),
+                    "phone_number": _normalize_phone_digits(result.get("phone_number") or base.get("phone_number")),
+                })
+
+        base["gender"] = _normalize_gender(base.get("gender"))
+        if not base.get("nationality"):
+            base["nationality"] = "TW"
+        if base.get("email"):
+            base["re-email"] = base.get("email")
+        missing = _require_fields(base, label)
+        if missing:
+            return None, "\u7f3a\u5c11\u5fc5\u586b\u6b04\u4f4d\uff1a" + ", ".join(missing)
+        return base, None
+
+    main_passenger, err = build_passenger(main_token, "\u4e3b\u4e58\u5ba2")
+    if err:
+        return None, None, None, err
+
+    companions = []
+    for idx, token in enumerate(companion_tokens, 1):
+        passenger, err = build_passenger(token, f"\u540c\u884c{idx}")
+        if err:
+            return None, None, None, err
+        companions.append(passenger)
+
+    emergency_entry = _match_alias(emergency_token, emergencies)
+    if not emergency_entry:
+        return None, None, None, f"\u627e\u4e0d\u5230\u7dca\u6025\u806f\u7d61\u4eba\uff1a{emergency_token}"
+    emergency = emergency_entry.get("emergency_contact") if isinstance(emergency_entry.get("emergency_contact"), dict) else {}
+    missing_emg = _require_emergency_fields(emergency)
+    if missing_emg:
+        return None, None, None, "\u7dca\u6025\u806f\u7d61\u4eba\u7f3a\u6b04\uff1a" + ", ".join(missing_emg)
+
+    return main_passenger, companions, emergency, None
+
+
+def _book_and_paylink_with_people(
+    date: str,
+    tier: int,
+    names: list[str],
+    ttl_seconds: int,
+    trace_id: str,
+) -> tuple[dict, int]:
+    access_token = get_latest_access_token()
+    if not access_token:
+        return {"ok": False, "error": "\u8acb\u5148\u624b\u52d5\u767b\u5165\u4e00\u6b21\u8b93 Token Sync \u56de\u704c"}, 401
+
+    pax = max(len(names) - 1, 0)
+    allotment, err = _resolve_allotment(access_token, date, tier, pax)
+    if err:
+        return {"ok": False, "error": err}, 400
+
+    cabin_allotment_id = int(allotment.get("cabin_allotment_id") or 0)
+    itinerary_id = int(allotment.get("itinerary_id") or 0)
+    non_member_surcharge_id = int(allotment.get("non_member_surcharge_id") or 0)
+    record_updated_time = allotment.get("record_updated_time")
+    if not record_updated_time:
+        return {"ok": False, "error": "\u7121\u6cd5\u53d6\u5f97 recordUpdatedTime"}, 400
+
+    draft_payload = {
+        "cabin_allotment_id": cabin_allotment_id,
+        "customer_pax": pax,
+        "gratuity_charge_id": None,
+        "itinerary_id": itinerary_id,
+        "non_member_surcharge_id": non_member_surcharge_id,
+        "record_updated_time": record_updated_time,
+    }
+
+    headers = _cruise_payment_headers(access_token)
+    draft_url = f"{CRUISE_BACKEND_BASE}/customers/v2/booking/draft"
+    try:
+        r = requests.post(draft_url, headers=headers, json=draft_payload, timeout=20)
+    except Exception as ex:
+        print(f"[{ts()}] [CRUISE] trace={trace_id} draft error={type(ex).__name__}", flush=True)
+        return {"ok": False, "error": "\u5efa\u7acb\u8349\u7a3f\u5931\u6557\uff0c\u8acb\u7a0d\u5f8c\u91cd\u8a66"}, 502
+    if r.status_code == 401:
+        _log_backend_response(trace_id, "draft", r)
+        return {"ok": False, "error": "Token \u5df2\u904e\u671f\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66"}, 401
+    if r.status_code >= 400:
+        _log_backend_response(trace_id, "draft", r)
+        return {"ok": False, "error": "\u5efa\u7acb\u8349\u7a3f\u5931\u6557\uff0c\u8acb\u7a0d\u5f8c\u91cd\u8a66"}, 502
+
+    draft_data = _parse_json_response(r) or {}
+    booking_id = draft_data.get("booking_id")
+    if not booking_id:
+        return {"ok": False, "error": "\u5f8c\u7aef\u56de\u50b3\u7f3a\u5c11 booking_id"}, 502
+
+    check_url = f"{CRUISE_BACKEND_BASE}/booking/check-status/{booking_id}"
+    r = requests.get(check_url, headers=headers, timeout=20)
+    if r.status_code == 401:
+        _log_backend_response(trace_id, "check-status", r)
+        return {"ok": False, "error": "Token \u5df2\u904e\u671f\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66"}, 401
+    r.raise_for_status()
+    check_data = _parse_json_response(r) or {}
+    numeric_id = check_data.get("id") or check_data.get("booking_id")
+    try:
+        numeric_id = int(numeric_id)
+    except Exception:
+        numeric_id = 0
+    if numeric_id <= 0:
+        return {"ok": False, "error": "\u7121\u6cd5\u53d6\u5f97 numeric_id"}, 502
+
+    booking_url = f"{CRUISE_BACKEND_BASE}/booking/{numeric_id}"
+    r = requests.get(booking_url, headers=headers, timeout=20)
+    if r.status_code == 401:
+        _log_backend_response(trace_id, "booking", r)
+        return {"ok": False, "error": "Token \u5df2\u904e\u671f\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66"}, 401
+    r.raise_for_status()
+    booking_payload = _parse_json_response(r) or {}
+    if isinstance(booking_payload, dict) and isinstance(booking_payload.get("data"), dict):
+        booking_summary = booking_payload.get("data")
+    else:
+        booking_summary = booking_payload if isinstance(booking_payload, dict) else {}
+    if not isinstance(booking_summary, dict):
+        return {"ok": False, "error": "\u8a02\u55ae\u8cc7\u6599\u683c\u5f0f\u932f\u8aa4"}, 502
+
+    latest_record_updated_time = _extract_record_updated_time(booking_summary, record_updated_time)
+    if not latest_record_updated_time:
+        return {"ok": False, "error": "\u7121\u6cd5\u53d6\u5f97 recordUpdatedTime"}, 502
+
+    main_passenger, companions, emergency, err = _resolve_passengers_and_emergency(
+        access_token, numeric_id, latest_record_updated_time, names
+    )
+    if err:
+        return {"ok": False, "error": err}, 400
+
+    booking_payload = _build_booking_payload(
+        numeric_id=numeric_id,
+        cabin_allotment_id=cabin_allotment_id,
+        customer_pax=pax,
+        record_updated_time=latest_record_updated_time,
+        main_passenger=main_passenger,
+        passengers=companions,
+        emergency_contact=emergency,
+    )
+
+    update_url = f"{CRUISE_BACKEND_BASE}/customers/v2/booking"
+    r = requests.post(update_url, headers=headers, json=booking_payload, timeout=20)
+    if r.status_code == 401:
+        _log_backend_response(trace_id, "booking-update", r)
+        return {"ok": False, "error": "Token \u5df2\u904e\u671f\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66"}, 401
+    if r.status_code >= 400:
+        _log_backend_response(trace_id, "booking-update", r)
+        return {"ok": False, "error": "\u66f4\u65b0\u4e58\u5ba2\u8cc7\u6599\u5931\u6557"}, 502
+
+    r = requests.get(booking_url, headers=headers, timeout=20)
+    if r.status_code == 401:
+        _log_backend_response(trace_id, "booking-refresh", r)
+        return {"ok": False, "error": "Token \u5df2\u904e\u671f\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66"}, 401
+    r.raise_for_status()
+    booking_payload = _parse_json_response(r) or {}
+    if isinstance(booking_payload, dict) and isinstance(booking_payload.get("data"), dict):
+        booking_summary = booking_payload.get("data")
+    else:
+        booking_summary = booking_payload if isinstance(booking_payload, dict) else {}
+    latest_record_updated_time = _extract_record_updated_time(booking_summary, latest_record_updated_time)
+    if not latest_record_updated_time:
+        return {"ok": False, "error": "\u7121\u6cd5\u53d6\u5f97 recordUpdatedTime"}, 502
+
+    payment_method = _normalize_payment_method("credit_card") or []
+    paylink_entry = create_paylink_entry(
+        booking_id=numeric_id,
+        record_updated_time=latest_record_updated_time,
+        payment_method=payment_method,
+        ttl_seconds=ttl_seconds,
+    )
+    if not paylink_entry:
+        return {"ok": False, "error": "\u7121\u6cd5\u5efa\u7acb\u4ed8\u6b3e\u9023\u7d50"}, 500
+
+    pay_url = f"{_get_base_url()}/cruise/pay/{paylink_entry['code']}"
+    summary_text = build_paylink_summary_text(
+        booking_id=numeric_id,
+        pay_url=pay_url,
+        ttl_seconds=ttl_seconds,
+        booking_summary=booking_summary if isinstance(booking_summary, dict) else None,
+    )
+
+    payload_preview = json.dumps({
+        "customer_pax": pax,
+        "recordUpdatedTime": latest_record_updated_time,
+        "main_passenger": main_passenger,
+        "passenger_list": companions,
+        "emergency_contact": emergency,
+    }, ensure_ascii=False)
+
+    details_lines = [
+        summary_text,
+        f"\u4e58\u5ba2\u7e3d\u4eba\u6578\uff1a{pax}",
+        "",
+        "\u4e3b\u4e58\u5ba2\uff1a",
+        _format_passenger_details(main_passenger),
+    ]
+    for idx, p in enumerate(companions, 1):
+        details_lines.append("")
+        details_lines.append(f"\u540c\u884c{idx}\uff1a")
+        details_lines.append(_format_passenger_details(p))
+    details_lines.append("")
+    details_lines.append("\u7dca\u6025\u806f\u7d61\u4eba\uff1a")
+    details_lines.append(_format_emergency_details(emergency))
+    details_lines.append("")
+    details_lines.append("\u5373\u5c07\u9001\u51fa\u7684 booking payload\uff1a")
+    details_lines.append(payload_preview)
+
+    return {
+        "ok": True,
+        "summary_text": "\n".join(details_lines),
+        "pay_url": pay_url,
+        "expires_at": datetime.utcfromtimestamp(paylink_entry["expires_at"]).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }, 200
+
 def fetch_itinerary(access_token: str, date: str) -> str | None:
     url = f"{CRUISE_BACKEND_BASE}/customers/list/itinerary"
     params = {"departure_date": date, "lang": "hant", "page": 1}
@@ -1659,26 +2223,75 @@ def handle_cruise_message(event):
             reply = "\u4f60\u6c92\u6709\u8a02\u623f\u6b0a\u9650\uff08\u50c5\u9650\u7ba1\u7406\u8005\uff09"
             cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
             return
-        payload_text = raw_text[2:].strip()
-        if not payload_text:
-            reply = (
-                "\u8acb\u7528\uff1a\u8a02\u623f {JSON}\n"
-                "\u4f8b\u5982\uff1a\u8a02\u623f {\"cabin_allotment_id\":31020,"
-                "\"customer_pax\":2,\"itinerary_id\":698,"
-                "\"non_member_surcharge_id\":95,"
-                "\"record_updated_time\":\"2026-01-15T05:57:51Z\","
-                "\"payment_method\":\"credit_card\",\"ttl_seconds\":600}"
+        if "{" in raw_text:
+            payload_text = raw_text[2:].strip()
+            if not payload_text:
+                reply = (
+                    "\u8acb\u7528\uff1a\u8a02\u623f {JSON}\n"
+                    "\u4f8b\u5982\uff1a\u8a02\u623f {\"cabin_allotment_id\":31020,"
+                    "\"customer_pax\":2,\"itinerary_id\":698,"
+                    "\"non_member_surcharge_id\":95,"
+                    "\"record_updated_time\":\"2026-01-15T05:57:51Z\","
+                    "\"payment_method\":\"credit_card\",\"ttl_seconds\":600}"
+                )
+                cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+                return
+            try:
+                payload = json.loads(payload_text)
+            except Exception:
+                reply = "JSON \u683c\u5f0f\u932f\u8aa4\uff0c\u8acb\u7528\uff1a\u8a02\u623f {JSON}"
+                cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+                return
+            trace_id = _make_trace_id()
+            result, status = _book_and_paylink_flow(payload, _get_base_url(), trace_id)
+            if status != 200 or not result.get("ok"):
+                reply = result.get("error") or "\u8a02\u623f\u5931\u6557\uff0c\u8acb\u7a0d\u5f8c\u91cd\u8a66"
+                cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+                return
+            summary_text = result.get("summary_text") or ""
+            pay_url = result.get("pay_url") or ""
+            expires_at = result.get("expires_at") or ""
+            extra = (
+                f"\ud83d\udc49 \u524d\u5f80\u4ed8\u6b3e\uff1a{pay_url}\n"
+                f"\uff08\u9023\u7d50\u6709\u6548\u81f3 {expires_at}\uff0c\u4e00\u6b21\u6027\uff09"
+                if pay_url
+                else "\u4ed8\u6b3e\u9023\u7d50\u672a\u53d6\u5f97\uff0c\u8acb\u7a0d\u5f8c\u91cd\u8a66"
             )
+            cruise_line_bot_api.reply_message(
+                event.reply_token,
+                [TextSendMessage(text=summary_text), TextSendMessage(text=extra)],
+            )
+            return
+
+        parts = raw_text.split()
+        if len(parts) < 5 or parts[-1] != "\u9001\u51fa":
+            reply = "\u8acb\u7528\uff1a\u8a02\u623f <\u65e5\u671f> <\u623f\u578b> <\u4eba\u540d...> \u9001\u51fa"
             cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
             return
-        try:
-            payload = json.loads(payload_text)
-        except Exception:
-            reply = "JSON \u683c\u5f0f\u932f\u8aa4\uff0c\u8acb\u7528\uff1a\u8a02\u623f {JSON}"
+        date_text = _parse_flexible_date(parts[1])
+        tier = _parse_tier(parts[2])
+        names = parts[3:-1]
+        if not date_text:
+            reply = "\u65e5\u671f\u683c\u5f0f\u932f\u8aa4\uff0c\u8acb\u7528 YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD / YYYYMMDD"
             cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
             return
+        if not tier:
+            reply = "\u623f\u578b\u8acb\u8f38\u5165\uff1a\u5167\u5074 / \u6d77\u666f / \u9732\u53f0 / \u967d\u53f0"
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
+        if len(names) < 2:
+            reply = "\u4eba\u540d\u6578\u4e0d\u8db3\uff0c\u9700\u8981\u4e3b\u4e58\u5ba2 + \u7dca\u6025\u806f\u7d61\u4eba"
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
+
         trace_id = _make_trace_id()
-        result, status = _book_and_paylink_flow(payload, _get_base_url(), trace_id)
+        result, status = _book_and_paylink_with_people(
+            date=date_text,
+            tier=tier,
+            names=names,
+            ttl_seconds=1800,
+            trace_id=trace_id,
+        )
         if status != 200 or not result.get("ok"):
             reply = result.get("error") or "\u8a02\u623f\u5931\u6557\uff0c\u8acb\u7a0d\u5f8c\u91cd\u8a66"
             cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
@@ -1692,10 +2305,11 @@ def handle_cruise_message(event):
             if pay_url
             else "\u4ed8\u6b3e\u9023\u7d50\u672a\u53d6\u5f97\uff0c\u8acb\u7a0d\u5f8c\u91cd\u8a66"
         )
-        cruise_line_bot_api.reply_message(
-            event.reply_token,
-            [TextSendMessage(text=summary_text), TextSendMessage(text=extra)],
-        )
+        chunks = []
+        for chunk in _split_line_messages(summary_text):
+            chunks.append(TextSendMessage(text=chunk))
+        chunks.append(TextSendMessage(text=extra))
+        cruise_line_bot_api.reply_message(event.reply_token, chunks[:5])
         return
 
     list_keywords = ("列出監控", "監控列表", "顯示監控", "列出", "列表","LIST","List","list")
