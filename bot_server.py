@@ -20,6 +20,7 @@ from filelock import FileLock
 load_dotenv()
 
 app = Flask(__name__)
+app.json.ensure_ascii = False
 @app.get("/_routes")
 def list_routes():
     return jsonify(sorted([str(r) for r in app.url_map.iter_rules()]))
@@ -90,22 +91,66 @@ def cruise_tokens_get():
 def cruise_pay(code: str):
     if not os.path.exists(PAY_LINKS_FILE):
         return jsonify({"ok": False, "error": f"pay_links not found: {PAY_LINKS_FILE}"}), 404
+
+    now = int(time.time())
     lock = FileLock(PAY_LINKS_LOCK)
     with lock:
-        links = read_json_utf8sig(PAY_LINKS_FILE, {})
-    if not isinstance(links, dict) or code not in links:
-        return jsonify({"ok": False, "error": f"unknown code: {code}"}), 404
+        links = read_json(PAY_LINKS_FILE, {})
+        if not isinstance(links, dict) or code not in links:
+            resp = jsonify({"ok": False, "error": "此連結已經使用過，請重新下單"})
+            resp.headers["Content-Type"] = "application/json; charset=utf-8"
+            return resp, 410
+
+
+        # Optional cleanup of stale entries
+        cleaned = False
+        for k in list(links.keys()):
+            item = links.get(k)
+
+            # 非 dict 的舊/壞資料：直接清掉（或 continue）
+            if not isinstance(item, dict):
+                del links[k]
+                cleaned = True
+                continue
+            
+            created_at = int(item.get("created_at") or 0)
+            expires_at = int(item.get("expires_at") or 0)
+            used_at = int(item.get("used_at") or 0)
+
+            if (expires_at and expires_at < now - 3600) or (used_at and created_at and created_at < now - 3600):
+                del links[k]
+                cleaned = True
+
+        if cleaned:
+            write_json_atomic(PAY_LINKS_FILE, links)
+
+        entry = links.get(code)
+        if not isinstance(entry, dict):
+            resp = jsonify({"ok": False, "error": "此連結已經使用過，請重新下單"})
+            resp.headers["Content-Type"] = "application/json; charset=utf-8"
+            return resp, 410
+
+        expires_at = int(entry.get("expires_at") or 0)
+        used_at = int(entry.get("used_at") or 0)
+        if expires_at and now > expires_at:
+            return jsonify({"ok": False, "error": "expired"}), 410
+        if used_at != 0:
+            return jsonify({"ok": False, "error": "used"}), 410
+
+        booking_id = entry.get("booking_id")
+        record_updated_time = entry.get("recordUpdatedTime")
+        payment_method = entry.get("payment_method")
+        if not booking_id or not record_updated_time or not payment_method:
+            return jsonify({"ok": False, "error": "invalid pay_links entry"}), 400
+
+        # Mark used before calling payment API to prevent replay
+        entry["used_at"] = now
+        links[code] = entry
+        write_json_atomic(PAY_LINKS_FILE, links)
 
     access_token = get_latest_access_token()
     if not access_token:
         return "No access token found. Please login and sync tokens first.", 500
-
-    payload = links.get(code) or {}
-    booking_id = payload.get("booking_id")
-    record_updated_time = payload.get("recordUpdatedTime")
-    payment_method = payload.get("payment_method")
-    if not booking_id or not record_updated_time or not payment_method:
-        return jsonify({"ok": False, "error": "invalid pay_links entry"}), 400
 
     body = {
         "booking_id": booking_id,
@@ -114,15 +159,60 @@ def cruise_pay(code: str):
     }
 
     url = f"{CRUISE_BACKEND_BASE}/customers/v2/booking/payment/{booking_id}"
-    r = requests.post(url, headers=_cruise_payment_headers(access_token), json=body, timeout=20)
-    r.raise_for_status()
-    data = r.json() or {}
-    cs = (data.get("cybersource_response") or {})
-    endpoint = cs.get("endPoint")
-    config = cs.get("config") or {}
+    try:
+        r = requests.post(url, headers=_cruise_payment_headers(access_token), json=body, timeout=20)
+        r.raise_for_status()
+        data = r.json() or {}
+        cs = (data.get("cybersource_response") or {})
+        endpoint = cs.get("endPoint")
+        config = cs.get("config") or {}
+        if not endpoint or not isinstance(config, dict) or not config:
+            raise ValueError("missing cybersource response")           
+    except requests.HTTPError as ex:
+        # HTTP 4xx/5xx：把後端回的 body 帶出來方便定位
+        resp = ex.response
+        status = resp.status_code if resp is not None else None
+        detail = ""
+        if resp is not None:
+            # 先試 JSON，失敗就用文字
+            try:
+                detail_obj = resp.json()
+                detail = detail_obj
+            except Exception:
+                detail = (resp.text or "")[:1200]  # 截短避免太長
+        # rollback used_at
+        lock = FileLock(PAY_LINKS_LOCK)
+        with lock:
+            links = read_json(PAY_LINKS_FILE, {})
+            entry2 = links.get(code)
+            if isinstance(entry2, dict) and entry2.get("used_at") == now:
+                entry2["used_at"] = 0
+                links[code] = entry2
+                write_json_atomic(PAY_LINKS_FILE, links)
+    
+        err = "payment api failed" if status is None else f"payment api failed ({status})"
+        return jsonify({"ok": False, "error": err, "detail": detail}), 502
+    
+    except Exception as ex:
+        # timeout / json decode / ValueError 等
+        lock = FileLock(PAY_LINKS_LOCK)
+        with lock:
+            links = read_json(PAY_LINKS_FILE, {})
+            entry2 = links.get(code)
+            if isinstance(entry2, dict) and entry2.get("used_at") == now:
+                entry2["used_at"] = 0
+                links[code] = entry2
+                write_json_atomic(PAY_LINKS_FILE, links)
+    
+        return jsonify({"ok": False, "error": f"payment api failed", "detail": str(ex)}), 502        
 
-    if not endpoint or not isinstance(config, dict) or not config:
-        return jsonify({"ok": False, "error": "missing cybersource response"}), 502
+    # Option B: delete entry after successful redirect to keep file clean.
+    lock = FileLock(PAY_LINKS_LOCK)
+    with lock:
+        links = read_json(PAY_LINKS_FILE, {})
+        if isinstance(links, dict) and code in links:
+            del links[code]
+            write_json_atomic(PAY_LINKS_FILE, links)
 
     html_page = _build_auto_post_form(endpoint, config)
     return html_page, 200, {"Content-Type": "text/html; charset=utf-8"}
@@ -166,7 +256,7 @@ def cruise_paylink_create():
 
     lock = FileLock(PAY_LINKS_LOCK)
     with lock:
-        links = read_json_utf8sig(PAY_LINKS_FILE, {})
+        links = read_json(PAY_LINKS_FILE, {})
         if not isinstance(links, dict):
             links = {}
 
@@ -344,20 +434,6 @@ def write_json_atomic(path: str, data):
         os.replace(tmp_path, path)
     except Exception as e:
         print(f"[{ts()}] \u26a0\ufe0f \u5beb\u5165 {path} \u5931\u6557:{type(e).__name__}: {e}")
-
-
-def read_json_utf8sig(path: str, default):
-    try:
-        if not os.path.exists(path):
-            return default
-        with open(path, "r", encoding="utf-8-sig") as f:
-            content = f.read().strip()
-        if not content:
-            return default
-        return json.loads(content)
-    except Exception as e:
-        print(f"[{ts()}] \u26a0\ufe0f \u8b80\u53d6 {path} \u5931\u6557：{type(e).__name__}: {e}")
-        return default
 
 
 def load_features() -> dict:
