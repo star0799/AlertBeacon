@@ -59,13 +59,18 @@ CRUISE_BACKEND_BASE = "https://backend-prd.b2m.stardreamcruises.com"
 
 _latest_recaptcha = {"token": None, "at": None, "action": None}
 _latest_tokens = {"accessToken": None, "refreshToken": None, "user": None, "at": None}
+CRUISE_RELOGIN_NEEDED = False
+LAST_RELOGIN_ALERT_AT = 0.0
+LAST_RECOVER_ALERT_AT = 0.0
 
 @app.post("/cruise/tokens")
 def cruise_tokens():
     data = request.get_json(force=True, silent=True) or {}
     if not data.get("accessToken") or not data.get("refreshToken"):
         return jsonify({"ok": False, "error": "missing tokens"}), 400
+    global CRUISE_RELOGIN_NEEDED, LAST_RECOVER_ALERT_AT
     was_missing = not (_latest_tokens.get("accessToken") and _latest_tokens.get("refreshToken"))
+    prev_access = _latest_tokens.get("accessToken")
     _latest_tokens.update({
         "accessToken": data["accessToken"],
         "refreshToken": data["refreshToken"],
@@ -74,15 +79,20 @@ def cruise_tokens():
     })
     write_json(TOKENS_CACHE_FILE, _latest_tokens)
     print(f"[{ts()}] [CRUISE] tokens updated", _latest_tokens["at"])
-    if was_missing:
-        users = read_json(USERS_CRUISE_FILE, [])
-        if users:
-            msg = TextSendMessage(text="✅ Cruise token 已更新，監控已恢復。")
-            for uid in users:
-                try:
-                    cruise_line_bot_api.push_message(uid, msg)
-                except Exception as e:
-                    print(f"[{ts()}] [CRUISE] notify failed:", uid, repr(e), flush=True)
+    should_notify = CRUISE_RELOGIN_NEEDED or (prev_access != data.get("accessToken"))
+    if should_notify:
+        now = time.time()
+        if now - LAST_RECOVER_ALERT_AT >= 60:
+            users = read_json(USERS_CRUISE_FILE, [])
+            if users:
+                msg = TextSendMessage(text="✅ Cruise token 已更新，監控已恢復")
+                for uid in users:
+                    try:
+                        cruise_line_bot_api.push_message(uid, msg)
+                    except Exception as e:
+                        print(f"[{ts()}] [CRUISE] notify failed:", uid, repr(e), flush=True)
+                LAST_RECOVER_ALERT_AT = now
+        CRUISE_RELOGIN_NEEDED = False
     return jsonify({"ok": True})
 
 @app.get("/cruise/tokens")
@@ -277,6 +287,8 @@ def cruise_pay(code: str):
                 links[code] = entry2
                 write_json_atomic(PAY_LINKS_FILE, links)
     
+        if status in (401, 403):
+            trigger_relogin("payment", f"status={status}")
         err = "payment api failed" if status is None else f"payment api failed ({status})"
         return jsonify({"ok": False, "error": err, "detail": detail}), 502
     
@@ -585,6 +597,31 @@ def feature_enabled(name: str) -> bool:
     return bool(FEATURES.get(name, True))
 
 
+def trigger_relogin(reason: str, detail: str = "") -> None:
+    global CRUISE_RELOGIN_NEEDED
+    if CRUISE_RELOGIN_NEEDED:
+        print(f"[{ts()}] [CRUISE] relogin already needed reason={reason}", flush=True)
+        return
+
+    users = read_json(USERS_CRUISE_FILE, [])
+    if users:
+        msg_text = (
+            "⚠️ Cruise 需要重新登入一次（token 失效/未授權）\n"
+            "請開啟 SDC 登入並讓 Token Sync 回灌\n"
+            f"{detail or reason}"
+        )
+        msg = TextSendMessage(text=msg_text)
+        for uid in users:
+            try:
+                cruise_line_bot_api.push_message(uid, msg)
+            except Exception as e:
+                print(f"[{ts()}] [CRUISE] relogin notify failed:", uid, repr(e), flush=True)
+
+    _latest_tokens.update({"accessToken": None, "refreshToken": None, "user": None, "at": None})
+    write_json(TOKENS_CACHE_FILE, _latest_tokens)
+    CRUISE_RELOGIN_NEEDED = True
+
+
 def is_cruise_daemon_enabled() -> bool:
     if not os.path.exists(FEATURES_FILE):
         print(f"[{ts()}] [CRUISE] features missing: {FEATURES_FILE}", flush=True)
@@ -648,7 +685,7 @@ def get_latest_access_token():
         return access
     cached = read_json(TOKENS_CACHE_FILE, {})
     if isinstance(cached, dict):
-        return cached.get("accessToken") or cached.get("at")
+        return cached.get("accessToken") or cached.get("access_token")
     return None
 
 
@@ -1108,6 +1145,7 @@ def _book_and_paylink_flow(data: dict, base_url: str, trace_id: str) -> tuple[di
             print(f"[{ts()}] [CRUISE] trace={trace_id} draft error={type(ex).__name__}", flush=True)
             return {"ok": False, "error": "後端建立草稿失敗，請稍後重試"}, 502
         if r.status_code == 401:
+            trigger_relogin("draft", f"status={r.status_code}")
             _log_backend_response(trace_id, "draft", r)
             return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
         if r.status_code >= 400:
@@ -1126,6 +1164,7 @@ def _book_and_paylink_flow(data: dict, base_url: str, trace_id: str) -> tuple[di
             print(f"[{ts()}] [CRUISE] trace={trace_id} check-status error={type(ex).__name__}", flush=True)
             return {"ok": False, "error": "後端查詢訂單狀態失敗，請稍後重試"}, 502
         if r.status_code == 401:
+            trigger_relogin("check-status", f"status={r.status_code}")
             _log_backend_response(trace_id, "check-status", r)
             return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
         if r.status_code >= 400:
@@ -1148,6 +1187,7 @@ def _book_and_paylink_flow(data: dict, base_url: str, trace_id: str) -> tuple[di
             print(f"[{ts()}] [CRUISE] trace={trace_id} booking error={type(ex).__name__}", flush=True)
             return {"ok": False, "error": "後端查詢訂單詳情失敗，請稍後重試"}, 502
         if r.status_code == 401:
+            trigger_relogin("booking", f"status={r.status_code}")
             _log_backend_response(trace_id, "booking", r)
             return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
         if r.status_code >= 400:
@@ -1421,7 +1461,8 @@ def _resolve_allotment(access_token: str, date: str, tier: int, pax: int) -> tup
         )
     except Exception:
         return None, "\u67e5\u8a62\u623f\u578b\u5931\u6557\uff0c\u8acb\u7a0d\u5f8c\u518d\u8a66"
-    if r.status_code == 401:
+    if r.status_code in (401, 403):
+        trigger_relogin("cabin-allotment", f"status={r.status_code}")
         return None, "Token \u5df2\u904e\u671f\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66"
     try:
         r.raise_for_status()
@@ -1642,6 +1683,7 @@ def _book_and_paylink_with_people(
         print(f"[{ts()}] [CRUISE] trace={trace_id} draft error={type(ex).__name__}", flush=True)
         return {"ok": False, "error": "\u5efa\u7acb\u8349\u7a3f\u5931\u6557\uff0c\u8acb\u7a0d\u5f8c\u91cd\u8a66"}, 502
     if r.status_code == 401:
+        trigger_relogin("draft", f"status={r.status_code}")
         _log_backend_response(trace_id, "draft", r)
         return {"ok": False, "error": "Token \u5df2\u904e\u671f\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66"}, 401
     if r.status_code >= 400:
@@ -1656,6 +1698,7 @@ def _book_and_paylink_with_people(
     check_url = f"{CRUISE_BACKEND_BASE}/booking/check-status/{booking_id}"
     r = requests.get(check_url, headers=headers, timeout=20)
     if r.status_code == 401:
+        trigger_relogin("check-status", f"status={r.status_code}")
         _log_backend_response(trace_id, "check-status", r)
         return {"ok": False, "error": "Token \u5df2\u904e\u671f\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66"}, 401
     r.raise_for_status()
@@ -1671,6 +1714,7 @@ def _book_and_paylink_with_people(
     booking_url = f"{CRUISE_BACKEND_BASE}/booking/{numeric_id}"
     r = requests.get(booking_url, headers=headers, timeout=20)
     if r.status_code == 401:
+        trigger_relogin("booking", f"status={r.status_code}")
         _log_backend_response(trace_id, "booking", r)
         return {"ok": False, "error": "Token \u5df2\u904e\u671f\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66"}, 401
     r.raise_for_status()
@@ -1705,6 +1749,7 @@ def _book_and_paylink_with_people(
     update_url = f"{CRUISE_BACKEND_BASE}/customers/v2/booking"
     r = requests.post(update_url, headers=headers, json=booking_payload, timeout=20)
     if r.status_code == 401:
+        trigger_relogin("booking-update", f"status={r.status_code}")
         _log_backend_response(trace_id, "booking-update", r)
         return {"ok": False, "error": "Token \u5df2\u904e\u671f\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66"}, 401
     if r.status_code >= 400:
@@ -1713,6 +1758,7 @@ def _book_and_paylink_with_people(
 
     r = requests.get(booking_url, headers=headers, timeout=20)
     if r.status_code == 401:
+        trigger_relogin("booking-refresh", f"status={r.status_code}")
         _log_backend_response(trace_id, "booking-refresh", r)
         return {"ok": False, "error": "Token \u5df2\u904e\u671f\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66"}, 401
     r.raise_for_status()
@@ -1780,6 +1826,9 @@ def fetch_itinerary(access_token: str, date: str) -> str | None:
     url = f"{CRUISE_BACKEND_BASE}/customers/list/itinerary"
     params = {"departure_date": date, "lang": "hant", "page": 1}
     r = requests.get(url, params=params, headers=_cruise_headers(access_token), timeout=10)
+    if r.status_code in (401, 403):
+        trigger_relogin("fetch_itinerary", f"status={r.status_code}")
+        return None
     r.raise_for_status()
     items = (r.json() or {}).get("items") or []
     for it in items:
@@ -1793,6 +1842,9 @@ def fetch_port(access_token: str, date: str) -> dict | None:
     url = f"{CRUISE_BACKEND_BASE}/customers/list/port"
     params = {"departure_date": date, "lang": "hant", "page": 1}
     r = requests.get(url, params=params, headers=_cruise_headers(access_token), timeout=10)
+    if r.status_code in (401, 403):
+        trigger_relogin("fetch_port", f"status={r.status_code}")
+        return None
     r.raise_for_status()
     items = (r.json() or {}).get("items") or []
     if not items:
