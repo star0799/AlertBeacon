@@ -413,6 +413,46 @@ def cruise_book_and_paylink():
     return resp, status
 
 
+@app.post("/cruise/command")
+def cruise_command():
+    admin_key = CRUISE_ADMIN_KEY or ""
+    if not admin_key:
+        return jsonify({"ok": False, "error": "API_DISABLED", "message": "cruise command disabled"}), 503
+    provided_key = request.headers.get("X-CRUISE-ADMIN-KEY")
+    if not provided_key or provided_key != admin_key:
+        return jsonify({"ok": False, "error": "UNAUTHORIZED", "message": "invalid admin key"}), 401
+
+    data = request.get_json(force=True, silent=True) or {}
+    text = data.get("text")
+    line_user_id = data.get("line_user_id")
+    reply = bool(data.get("reply", False))
+    dry_run = bool(data.get("dry_run", False))
+    if not text or not line_user_id:
+        return jsonify({"ok": False, "error": "BAD_REQUEST", "message": "missing text/line_user_id"}), 400
+    if not is_cruise_daemon_enabled():
+        return jsonify({"ok": False, "error": "FEATURE_DISABLED", "message": "cruise disabled"}), 503
+    if not is_cruise_admin(line_user_id):
+        return jsonify({"ok": False, "error": "FORBIDDEN", "message": "not admin"}), 403
+
+    result = process_cruise_text_command(
+        text=text,
+        line_user_id=line_user_id,
+        reply=reply,
+        dry_run=dry_run,
+        source_type="test",
+    )
+    if result.get("ok"):
+        return jsonify(result), 200
+    error_type = result.get("error_type")
+    if error_type == "relogin_required":
+        return jsonify(result), 409
+    if error_type in ("parse_error", "auth_mismatch"):
+        return jsonify(result), 400
+    if error_type == "upstream_error":
+        return jsonify(result), 502
+    return jsonify(result), 500
+
+
 @app.post("/cruise/paylink/notify")
 def cruise_paylink_notify():
     if not feature_enabled("cruise_daemon"):
@@ -1585,6 +1625,248 @@ def _split_line_messages(text: str, limit: int = 1800) -> list[str]:
     return parts
 
 
+def _prepare_passengers_from_private(names: list[str]) -> tuple[dict | None, list | None, dict | None, list]:
+    people, emergencies = _load_private_people()
+    errors = []
+
+    def build_passenger(token: str, label: str) -> dict | None:
+        entry = _match_alias(token, people)
+        if not entry:
+            errors.append(f"\u627e\u4e0d\u5230\u4e58\u5ba2\u8cc7\u6599\uff1a{label}({token})")
+            return None
+        passenger = entry.get("passenger") if isinstance(entry.get("passenger"), dict) else {}
+        overrides = entry.get("passenger_overrides") if isinstance(entry.get("passenger_overrides"), dict) else {}
+        base = _merge_dict(passenger, overrides)
+        base["gender"] = _normalize_gender(base.get("gender"))
+        if not base.get("nationality"):
+            base["nationality"] = "TW"
+        if base.get("email"):
+            base["re-email"] = base.get("email")
+        missing = _require_fields(base, label)
+        if missing:
+            errors.append("\u7f3a\u5c11\u5fc5\u586b\u6b04\u4f4d\uff1a" + ", ".join(missing))
+            return None
+        return base
+
+    main = build_passenger(names[0], "\u4e3b\u4e58\u5ba2")
+    companions = []
+    for idx, token in enumerate(names[1:-1], 1):
+        p = build_passenger(token, f"\u540c\u884c{idx}")
+        if p:
+            companions.append(p)
+
+    emergency_entry = _match_alias(names[-1], emergencies)
+    emergency = None
+    if not emergency_entry:
+        errors.append(f"\u627e\u4e0d\u5230\u7dca\u6025\u806f\u7d61\u4eba\uff1a{names[-1]}")
+    else:
+        emergency = emergency_entry.get("emergency_contact") if isinstance(emergency_entry.get("emergency_contact"), dict) else {}
+        missing_emg = _require_emergency_fields(emergency)
+        if missing_emg:
+            errors.append("\u7dca\u6025\u806f\u7d61\u4eba\u7f3a\u6b04\uff1a" + ", ".join(missing_emg))
+
+    return main, companions, emergency, errors
+
+
+def process_cruise_text_command(
+    text: str,
+    line_user_id: str,
+    reply_token: str | None = None,
+    reply: bool = False,
+    dry_run: bool = False,
+    source_type: str = "webhook",
+) -> dict:
+    result = {
+        "ok": False,
+        "input": {"text": text, "line_user_id": line_user_id},
+        "parsed": {},
+        "actions": {
+            "booking": {"attempted": False},
+            "paylink": {"attempted": False},
+        },
+        "errors": [],
+    }
+
+    raw_text = (text or "").strip()
+    if not raw_text:
+        result["errors"].append("missing text")
+        return result
+    if not raw_text.startswith(("\u8a02\u623f", "\u8ba2\u623f")):
+        result["errors"].append("unsupported command")
+        return result
+
+    json_mode = raw_text.startswith(("\u8a02\u623f {", "\u8ba2\u623f {"))
+    if json_mode:
+        payload_text = raw_text[2:].strip()
+        if not payload_text:
+            result["errors"].append("missing JSON payload")
+            result["error_type"] = "parse_error"
+            return result
+        try:
+            payload = json.loads(payload_text)
+        except Exception:
+            result["errors"].append("invalid JSON payload")
+            result["error_type"] = "parse_error"
+            return result
+        result["parsed"] = {"send_flag": True}
+        if dry_run:
+            result["actions"]["booking"] = {"attempted": False, "booking_request": payload}
+            result["actions"]["paylink"] = {"attempted": False, "paylink_record": {"ttl_seconds": payload.get("ttl_seconds")}}
+            result["ok"] = True
+            return result
+        trace_id = _make_trace_id()
+        flow_result, status = _book_and_paylink_flow(payload, _get_base_url(), trace_id)
+        result["actions"]["booking"]["attempted"] = True
+        result["actions"]["paylink"]["attempted"] = True
+        if status != 200 or not flow_result.get("ok"):
+            result["errors"].append(flow_result.get("error") or "booking failed")
+            if CRUISE_RELOGIN_NEEDED:
+                result["relogin_required"] = True
+                result["error_type"] = "relogin_required"
+            elif status >= 500:
+                result["error_type"] = "upstream_error"
+            else:
+                result["error_type"] = "parse_error"
+            return result
+        result["ok"] = True
+        result["actions"]["paylink"].update({
+            "pay_url": flow_result.get("pay_url"),
+            "expires_at": flow_result.get("expires_at"),
+            "summary_text": flow_result.get("summary_text"),
+        })
+        if reply or reply_token:
+            summary = flow_result.get("summary_text") or ""
+            pay_url = flow_result.get("pay_url") or ""
+            messages = []
+            if summary:
+                for chunk in _split_line_messages(summary):
+                    messages.append(TextSendMessage(text=chunk))
+            if pay_url:
+                messages.append(TextSendMessage(text=f"👉 前往付款：{pay_url}"))
+            if messages:
+                if reply_token:
+                    cruise_line_bot_api.reply_message(reply_token, messages[:5])
+                else:
+                    cruise_line_bot_api.push_message(line_user_id, messages[:5])
+                result["sent_to"] = line_user_id
+        return result
+
+    parts = raw_text.split()
+    if len(parts) < 5 or parts[-1] != "\u9001\u51fa":
+        result["errors"].append("missing send flag or too few parts")
+        result["error_type"] = "parse_error"
+        return result
+    date_text = _parse_flexible_date(parts[1])
+    tier = _parse_tier(parts[2])
+    names = parts[3:-1]
+    result["parsed"] = {
+        "date": date_text,
+        "cabin_type": parts[2],
+        "passengers": names,
+        "main_passenger": names[0] if names else None,
+        "emergency_contact": names[-1] if names else None,
+        "send_flag": True,
+    }
+    if not date_text:
+        result["errors"].append("invalid date format")
+        result["error_type"] = "parse_error"
+        return result
+    if not tier:
+        result["errors"].append("invalid cabin type")
+        result["error_type"] = "parse_error"
+        return result
+    if len(names) < 2:
+        result["errors"].append("insufficient passenger names")
+        result["error_type"] = "parse_error"
+        return result
+
+    if dry_run:
+        main, companions, emergency, errors = _prepare_passengers_from_private(names)
+        if errors:
+            result["errors"].extend(errors)
+        booking_request = {
+            "customer_pax": max(len(names) - 1, 0),
+            "recordUpdatedTime": None,
+            "main_passenger": main,
+            "passenger_list": companions or [],
+            "emergency_contact": emergency,
+        }
+        result["actions"]["booking"] = {"attempted": False, "booking_request": booking_request}
+        result["actions"]["paylink"] = {"attempted": False, "paylink_record": {"ttl_seconds": 1800}}
+        result["ok"] = not result["errors"]
+        if result["errors"]:
+            result["error_type"] = "parse_error"
+        return result
+
+    people_list, _ = _load_private_people()
+    selected_main = _match_alias(names[0], people_list)
+    if not selected_main:
+        result["errors"].append(f"main passenger not found: {names[0]}")
+        result["error_type"] = "parse_error"
+        return result
+    current_user = _latest_tokens.get("user_mmid")
+    if not current_user:
+        user_val = _latest_tokens.get("user")
+        if isinstance(user_val, dict):
+            current_user = user_val.get("mmid") or user_val.get("user_mmid") or user_val.get("username")
+        elif isinstance(user_val, str) and user_val.strip():
+            current_user = user_val.strip()
+    if not current_user:
+        result["errors"].append("\u76ee\u524d\u5c1a\u672a\u53d6\u5f97\u767b\u5165\u5e33\u865f\u8cc7\u8a0a\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66")
+        result["error_type"] = "relogin_required"
+        return result
+    main_is_member = bool(selected_main.get("is_member"))
+    main_mmid = selected_main.get("mmid")
+    if main_is_member and main_mmid and str(main_mmid) != str(current_user):
+        result["errors"].append("\u4e3b\u4e58\u5ba2\u7684\u6703\u54e1 MMID \u8207\u76ee\u524d\u767b\u5165\u7684\u5e33\u865f\u4e0d\u4e00\u81f4\uff0c\u8acb\u5148\u7528\u6b63\u78ba\u5e33\u865f\u767b\u5165\u5f8c\u518d\u4e0b\u55ae\u3002")
+        result["error_type"] = "auth_mismatch"
+        return result
+
+    trace_id = _make_trace_id()
+    flow_result, status = _book_and_paylink_with_people(
+        date=date_text,
+        tier=tier,
+        names=names,
+        ttl_seconds=1800,
+        trace_id=trace_id,
+    )
+    result["actions"]["booking"]["attempted"] = True
+    result["actions"]["paylink"]["attempted"] = True
+    if status != 200 or not flow_result.get("ok"):
+        result["errors"].append(flow_result.get("error") or "booking failed")
+        if CRUISE_RELOGIN_NEEDED:
+            result["relogin_required"] = True
+            result["error_type"] = "relogin_required"
+        elif status >= 500:
+            result["error_type"] = "upstream_error"
+        else:
+            result["error_type"] = "parse_error"
+        return result
+    result["ok"] = True
+    result["actions"]["paylink"].update({
+        "pay_url": flow_result.get("pay_url"),
+        "expires_at": flow_result.get("expires_at"),
+        "summary_text": flow_result.get("summary_text"),
+    })
+    if CRUISE_RELOGIN_NEEDED:
+        result["relogin_required"] = True
+    if reply or reply_token:
+        summary = flow_result.get("summary_text") or ""
+        pay_url = flow_result.get("pay_url") or ""
+        messages = []
+        if summary:
+            for chunk in _split_line_messages(summary):
+                messages.append(TextSendMessage(text=chunk))
+        if pay_url:
+            messages.append(TextSendMessage(text=f"👉 前往付款：{pay_url}"))
+        if messages:
+            if reply_token:
+                cruise_line_bot_api.reply_message(reply_token, messages[:5])
+            else:
+                cruise_line_bot_api.push_message(line_user_id, messages[:5])
+            result["sent_to"] = line_user_id
+    return result
+
 def _resolve_passengers_and_emergency(
     access_token: str,
     numeric_id: int,
@@ -2291,122 +2573,25 @@ def handle_cruise_message(event):
             reply = "\u4f60\u6c92\u6709\u8a02\u623f\u6b0a\u9650\uff08\u50c5\u9650\u7ba1\u7406\u8005\uff09"
             cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
             return
-        if "{" in raw_text:
-            payload_text = raw_text[2:].strip()
-            if not payload_text:
-                reply = (
-                    "\u8acb\u7528\uff1a\u8a02\u623f {JSON}\n"
-                    "\u4f8b\u5982\uff1a\u8a02\u623f {\"cabin_allotment_id\":31020,"
-                    "\"customer_pax\":2,\"itinerary_id\":698,"
-                    "\"non_member_surcharge_id\":95,"
-                    "\"record_updated_time\":\"2026-01-15T05:57:51Z\","
-                    "\"payment_method\":\"credit_card\",\"ttl_seconds\":600}"
-                )
-                cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-                return
-            try:
-                payload = json.loads(payload_text)
-            except Exception:
-                reply = "JSON \u683c\u5f0f\u932f\u8aa4\uff0c\u8acb\u7528\uff1a\u8a02\u623f {JSON}"
-                cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-                return
-            trace_id = _make_trace_id()
-            result, status = _book_and_paylink_flow(payload, _get_base_url(), trace_id)
-            if status != 200 or not result.get("ok"):
-                reply = result.get("error") or "\u8a02\u623f\u5931\u6557\uff0c\u8acb\u7a0d\u5f8c\u91cd\u8a66"
-                cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-                return
-            summary_text = result.get("summary_text") or ""
-            pay_url = result.get("pay_url") or ""
-            expires_at = result.get("expires_at") or ""
-            extra = (
-                f"\ud83d\udc49 \u524d\u5f80\u4ed8\u6b3e\uff1a{pay_url}\n"
-                f"\uff08\u9023\u7d50\u6709\u6548\u81f3 {expires_at}\uff0c\u4e00\u6b21\u6027\uff09"
-                if pay_url
-                else "\u4ed8\u6b3e\u9023\u7d50\u672a\u53d6\u5f97\uff0c\u8acb\u7a0d\u5f8c\u91cd\u8a66"
-            )
-            cruise_line_bot_api.reply_message(
-                event.reply_token,
-                [TextSendMessage(text=summary_text), TextSendMessage(text=extra)],
-            )
-            return
-
-        parts = raw_text.split()
-        if len(parts) < 5 or parts[-1] != "\u9001\u51fa":
-            reply = "\u8acb\u7528\uff1a\u8a02\u623f <\u65e5\u671f> <\u623f\u578b> <\u4eba\u540d...> \u9001\u51fa"
-            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-            return
-        date_text = _parse_flexible_date(parts[1])
-        tier = _parse_tier(parts[2])
-        names = parts[3:-1]
-        if not date_text:
-            reply = "\u65e5\u671f\u683c\u5f0f\u932f\u8aa4\uff0c\u8acb\u7528 YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD / YYYYMMDD"
-            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-            return
-        if not tier:
-            reply = "\u623f\u578b\u8acb\u8f38\u5165\uff1a\u5167\u5074 / \u6d77\u666f / \u9732\u53f0 / \u967d\u53f0"
-            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-            return
-        if len(names) < 2:
-            reply = "\u4eba\u540d\u6578\u4e0d\u8db3\uff0c\u9700\u8981\u4e3b\u4e58\u5ba2 + \u7dca\u6025\u806f\u7d61\u4eba"
-            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-            return
-
-        people_list, _ = _load_private_people()
-        selected_main = _match_alias(names[0], people_list)
-        if not selected_main:
-            reply = f"\u627e\u4e0d\u5230\u4e3b\u4e58\u5ba2\uff1a{names[0]}"
-            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-            return
-        current_user = _latest_tokens.get("user_mmid")
-        if not current_user:
-            user_val = _latest_tokens.get("user")
-            if isinstance(user_val, dict):
-                current_user = user_val.get("mmid") or user_val.get("user_mmid") or user_val.get("username")
-            elif isinstance(user_val, str) and user_val.strip():
-                current_user = user_val.strip()
-        if not current_user:
-            reply = "\u76ee\u524d\u5c1a\u672a\u53d6\u5f97\u767b\u5165\u5e33\u865f\u8cc7\u8a0a\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66"
-            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-            return
-        main_is_member = bool(selected_main.get("is_member"))
-        main_mmid = selected_main.get("mmid")
-        if main_is_member and main_mmid:
-            if str(main_mmid) != str(current_user):
-                reply = (
-                    "\u76ee\u524d\u767b\u5165\u5e33\u865f\u8207\u4e3b\u4e58\u5ba2\u4e0d\u4e00\u81f4"
-                    f"\uff08\u767b\u5165\uff1a{_mask_id(current_user)}\uff0c\u4e3b\u4e58\u5ba2\uff1a{_mask_id(main_mmid)}\uff09\uff0c"
-                    "\u8acb\u5207\u63db\u767b\u5165\u6216\u66f4\u63db\u4e3b\u4e58\u5ba2\u4ee3\u865f"
-                )
-                cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-                return
-
-        trace_id = _make_trace_id()
-        result, status = _book_and_paylink_with_people(
-            date=date_text,
-            tier=tier,
-            names=names,
-            ttl_seconds=1800,
-            trace_id=trace_id,
+        result = process_cruise_text_command(
+            text=raw_text,
+            line_user_id=event.source.user_id,
+            reply_token=event.reply_token,
+            reply=True,
+            dry_run=False,
+            source_type="webhook",
         )
-        if status != 200 or not result.get("ok"):
-            reply = result.get("error") or "\u8a02\u623f\u5931\u6557\uff0c\u8acb\u7a0d\u5f8c\u91cd\u8a66"
-            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-            return
-        summary_text = result.get("summary_text") or ""
-        pay_url = result.get("pay_url") or ""
-        expires_at = result.get("expires_at") or ""
-        extra = (
-            f"\ud83d\udc49 \u524d\u5f80\u4ed8\u6b3e\uff1a{pay_url}\n"
-            f"\uff08\u9023\u7d50\u6709\u6548\u81f3 {expires_at}\uff0c\u4e00\u6b21\u6027\uff09"
-            if pay_url
-            else "\u4ed8\u6b3e\u9023\u7d50\u672a\u53d6\u5f97\uff0c\u8acb\u7a0d\u5f8c\u91cd\u8a66"
-        )
-        chunks = []
-        for chunk in _split_line_messages(summary_text):
-            chunks.append(TextSendMessage(text=chunk))
-        chunks.append(TextSendMessage(text=extra))
-        cruise_line_bot_api.reply_message(event.reply_token, chunks[:5])
+        if not result.get("ok"):
+            reason = (result.get("errors") or [""])[0]
+            msg = (
+                "\u683c\u5f0f\u932f\u8aa4\uff0c\u8acb\u7528\uff1a\n"
+                "\u8a02\u623f <\u65e5\u671f> <\u623f\u578b> <\u4e3b\u4e58\u5ba2> [\u540c\u884c\u4e58\u5ba2...] <\u7dca\u6025\u806f\u7d61\u4eba> \u9001\u51fa\n"
+                "\u65e5\u671f\u652f\u63f4\uff1a2026-02-22 / 2026/2/22 / 2026.02.22 / 20260222\n"
+                "\u623f\u578b\uff1a\u5167\u5074 / \u6d77\u666f / \u9732\u53f0 / \u967d\u53f0\uff08\u9732\u53f0=\u967d\u53f0\uff09"
+            )
+            if reason:
+                msg = f"{reason}\n\n" + msg
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
         return
 
     list_keywords = ("列出監控", "監控列表", "顯示監控", "列出", "列表","LIST","List","list")
