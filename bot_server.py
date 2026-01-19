@@ -72,10 +72,15 @@ def cruise_tokens():
     was_missing = not (_latest_tokens.get("accessToken") and _latest_tokens.get("refreshToken"))
     prev_access = _latest_tokens.get("accessToken")
     user_val = data.get("user")
-    user_mmid = data.get("mmid") or data.get("user_mmid")
+    user_mmid = None
+    cand = data.get("mmid") or data.get("user_mmid")
+    if _looks_like_mmid(cand):
+        user_mmid = cand.strip()
     if not user_mmid and isinstance(user_val, dict):
-        user_mmid = user_val.get("mmid") or user_val.get("user_mmid") or user_val.get("username")
-    if not user_mmid and isinstance(user_val, str) and user_val.strip():
+        cand = user_val.get("mmid")
+        if _looks_like_mmid(cand):
+            user_mmid = cand.strip()
+    if not user_mmid and isinstance(user_val, str) and _looks_like_mmid(user_val):
         user_mmid = user_val.strip()
     _latest_tokens.update({
         "accessToken": data["accessToken"],
@@ -1049,6 +1054,44 @@ def _normalize_payment_method(value) -> list | None:
     return None
 
 
+def _build_payment_items(method_value, include_surcharge: bool) -> list | None:
+    items = _normalize_payment_method(method_value)
+    if not items:
+        return None
+    normalized = []
+    has_port_charge = False
+    has_surcharge = False
+    for item in items:
+        if not isinstance(item, dict):
+            return None
+        entry = dict(item)
+        if not entry.get("payment_for"):
+            entry["payment_for"] = "Port Charge"
+        if not entry.get("payment_method"):
+            return None
+        if entry.get("payment_for") == "Port Charge":
+            has_port_charge = True
+        if entry.get("payment_for") == "Non Member Surcharge":
+            has_surcharge = True
+        normalized.append(entry)
+    if not normalized:
+        return None
+    if not has_port_charge:
+        normalized.insert(0, {
+            "payment_for": "Port Charge",
+            "payment_method": normalized[0].get("payment_method"),
+        })
+    if include_surcharge:
+        if not has_surcharge:
+            normalized.append({
+                "payment_for": "Non Member Surcharge",
+                "payment_method": normalized[0].get("payment_method"),
+            })
+    else:
+        normalized = [item for item in normalized if item.get("payment_for") != "Non Member Surcharge"]
+    return normalized
+
+
 def _make_trace_id() -> str:
     return f"{int(time.time())}-{secrets.token_hex(3)}"
 
@@ -1148,10 +1191,17 @@ def _book_and_paylink_flow(data: dict, base_url: str, trace_id: str) -> tuple[di
         except Exception:
             return 0
 
+    def to_int_or_none(value):
+        try:
+            v = int(value)
+            return v if v > 0 else None
+        except Exception:
+            return None
+
     cabin_allotment_id = to_int(data.get("cabin_allotment_id"))
     customer_pax = to_int(data.get("customer_pax"))
     itinerary_id = to_int(data.get("itinerary_id"))
-    non_member_surcharge_id = to_int(data.get("non_member_surcharge_id"))
+    non_member_surcharge_id = to_int_or_none(data.get("non_member_surcharge_id"))
     record_updated_time = data.get("record_updated_time")
 
     missing = []
@@ -1161,14 +1211,15 @@ def _book_and_paylink_flow(data: dict, base_url: str, trace_id: str) -> tuple[di
         missing.append("customer_pax")
     if itinerary_id <= 0:
         missing.append("itinerary_id")
-    if non_member_surcharge_id <= 0:
-        missing.append("non_member_surcharge_id")
     if not isinstance(record_updated_time, str) or not record_updated_time.strip():
         missing.append("record_updated_time")
     if missing:
         return {"ok": False, "error": f"缺少必要欄位: {', '.join(missing)}"}, 400
 
-    payment_method = _normalize_payment_method(data.get("payment_method"))
+    payment_method = _build_payment_items(
+        data.get("payment_method"),
+        include_surcharge=non_member_surcharge_id is not None,
+    )
     if not payment_method:
         return {"ok": False, "error": "invalid payment_method"}, 400
 
@@ -1180,9 +1231,10 @@ def _book_and_paylink_flow(data: dict, base_url: str, trace_id: str) -> tuple[di
         "customer_pax": customer_pax,
         "gratuity_charge_id": None,
         "itinerary_id": itinerary_id,
-        "non_member_surcharge_id": non_member_surcharge_id,
         "record_updated_time": record_updated_time,
     }
+    if non_member_surcharge_id is not None:
+        draft_payload["non_member_surcharge_id"] = non_member_surcharge_id
 
     for attempt in range(2):
         draft_url = f"{CRUISE_BACKEND_BASE}/customers/v2/booking/draft"
@@ -1348,20 +1400,36 @@ def _match_alias(token: str, entries: list) -> dict | None:
     return None
 
 
-def _fetch_fc_list(access_token: str) -> list:
+def _fetch_fc_list(access_token: str) -> tuple[list, str | None]:
     url = f"{CRUISE_BACKEND_BASE}/frequent-cruisers-customer"
     r = requests.get(url, headers=_cruise_payment_headers(access_token), timeout=20)
     if r.status_code == 401:
         raise PermissionError("fc unauthorized")
     r.raise_for_status()
     payload = r.json() or {}
+    customer_mmid = None
     if isinstance(payload, dict):
+        customer_mmid = payload.get("customer_mmid") or payload.get("customerMmid")
         data = payload.get("data")
         if isinstance(data, list):
-            return [x for x in data if isinstance(x, dict)]
+            fc_list = [x for x in data if isinstance(x, dict)]
+            if not customer_mmid:
+                for item in fc_list:
+                    mmid = item.get("customer_mmid") or item.get("customerMmid")
+                    if mmid:
+                        customer_mmid = mmid
+                        break
+            return fc_list, customer_mmid
     if isinstance(payload, list):
-        return [x for x in payload if isinstance(x, dict)]
-    return []
+        fc_list = [x for x in payload if isinstance(x, dict)]
+        if not customer_mmid:
+            for item in fc_list:
+                mmid = item.get("customer_mmid") or item.get("customerMmid")
+                if mmid:
+                    customer_mmid = mmid
+                    break
+        return fc_list, customer_mmid
+    return [], customer_mmid
 
 
 def _match_fc_person(fc_list: list, fc_match: dict) -> dict | None:
@@ -1434,6 +1502,12 @@ def _mask_id(value: str | int | None, keep: int = 5) -> str:
     if len(s) <= keep:
         return s
     return s[:keep] + "***"
+
+
+def _looks_like_mmid(value: str | None) -> bool:
+    if not isinstance(value, str):
+        return False
+    return re.fullmatch(r"\d+", value.strip()) is not None
 
 
 def _validate_mmid(access_token: str, mmid: str, booking_id: int, record_updated_time: str) -> tuple[bool, dict | str]:
@@ -1548,16 +1622,35 @@ def _resolve_allotment(access_token: str, date: str, tier: int, pax: int) -> tup
     if not picked:
         return None, "\u67e5\u7121\u53ef\u7528\u623f\u578b"
 
+    try:
+        print(f"[{ts()}] [CRUISE] allotment picked keys: {list(picked.keys())}", flush=True)
+        picked_head = json.dumps(picked, ensure_ascii=False)[:800]
+        print(f"[{ts()}] [CRUISE] allotment picked head: {picked_head}", flush=True)
+        data_head = json.dumps(data, ensure_ascii=False)[:800] if isinstance(data, dict) else ""
+        if data_head:
+            print(f"[{ts()}] [CRUISE] allotment data head: {data_head}", flush=True)
+    except Exception as ex:
+        print(f"[{ts()}] [CRUISE] allotment debug log failed:", repr(ex), flush=True)
+
     result = {
         "cabin_allotment_id": picked.get("cabin_allotment_id") or picked.get("id"),
-        "itinerary_id": picked.get("itinerary_id") or picked.get("itineraryId"),
-        "non_member_surcharge_id": picked.get("non_member_surcharge_id") or picked.get("nonMemberSurchargeId"),
+        "itinerary_id": (data.get("itinerary_id") or data.get("itineraryId")) if isinstance(data, dict) else None,
+        "non_member_surcharge_id": (data.get("non_member_surcharge_id") or data.get("nonMemberSurchargeId")) if isinstance(data, dict) else None,
         "record_updated_time": picked.get("recordUpdatedTime") or picked.get("record_updated_time") or data.get("recordUpdatedTime"),
         "itinerary_name": itinerary_name,
         "port_name": port_info.get("port_name") or "",
     }
-    if not result["cabin_allotment_id"] or not result["itinerary_id"] or not result["non_member_surcharge_id"]:
-        return None, "\u7121\u6cd5\u53d6\u5f97\u8a02\u623f\u53c3\u6578\uff0c\u8acb\u7a0d\u5f8c\u91cd\u8a66"
+    if not result["itinerary_id"]:
+        result["itinerary_id"] = picked.get("itinerary_id") or picked.get("itineraryId")
+    if not result["non_member_surcharge_id"]:
+        result["non_member_surcharge_id"] = picked.get("non_member_surcharge_id") or picked.get("nonMemberSurchargeId")
+    missing = []
+    if not result["cabin_allotment_id"]:
+        missing.append("cabin_allotment_id")
+    if not result["itinerary_id"]:
+        missing.append("itinerary_id")
+    if missing:
+        return None, f"\u7121\u6cd5\u53d6\u5f97\u8a02\u623f\u53c3\u6578\uff0c\u7f3a\u5c11\uff1a{', '.join(missing)}"
     return result, None
 
 
@@ -1874,7 +1967,7 @@ def _resolve_passengers_and_emergency(
     names: list[str],
 ) -> tuple[dict | None, list | None, dict | None, str | None]:
     people, emergencies = _load_private_people()
-    fc_list = _fetch_fc_list(access_token)
+    fc_list, customer_mmid = _fetch_fc_list(access_token)
 
     main_token = names[0]
     companion_tokens = names[1:-1]
@@ -1889,7 +1982,6 @@ def _resolve_passengers_and_emergency(
         fc_match = entry.get("fc_match") if isinstance(entry.get("fc_match"), dict) else None
         is_member = bool(entry.get("is_member"))
         mmid = entry.get("mmid") if is_member else None
-
         base = dict(passenger)
         if fc_match:
             fc_person = _match_fc_person(fc_list, fc_match)
@@ -1897,7 +1989,9 @@ def _resolve_passengers_and_emergency(
                 base = _merge_dict(_map_fc_to_passenger(fc_person), base)
         base = _merge_dict(base, overrides)
 
-        if is_member and mmid:
+        if is_member:
+            if not isinstance(mmid, str) or not mmid.strip():
+                return None, "\u6703\u54e1\u4e58\u5ba2\u7f3a\u5c11 mmid\uff0c\u8acb\u5728 private_people.json \u88dc\u9f4a"
             ok, result = _validate_mmid(access_token, mmid, numeric_id, record_updated_time)
             if not ok:
                 return None, f"\u6703\u54e1\u9a57\u8b49\u5931\u6557\uff1a{mmid} {result}"
@@ -1959,19 +2053,26 @@ def _book_and_paylink_with_people(
 
     cabin_allotment_id = int(allotment.get("cabin_allotment_id") or 0)
     itinerary_id = int(allotment.get("itinerary_id") or 0)
-    non_member_surcharge_id = int(allotment.get("non_member_surcharge_id") or 0)
+    non_member_surcharge_id = allotment.get("non_member_surcharge_id")
+    try:
+        non_member_surcharge_id = int(non_member_surcharge_id)
+    except Exception:
+        non_member_surcharge_id = None
+    if non_member_surcharge_id is not None and non_member_surcharge_id <= 0:
+        non_member_surcharge_id = None
     record_updated_time = allotment.get("record_updated_time")
-    if not record_updated_time:
-        return {"ok": False, "error": "\u7121\u6cd5\u53d6\u5f97 recordUpdatedTime"}, 400
+    if not isinstance(record_updated_time, str) or not record_updated_time.strip():
+        return {"ok": False, "error": "\u7f3a\u5c11 record_updated_time\uff0c\u7121\u6cd5\u5efa\u7acb draft"}, 400
 
     draft_payload = {
         "cabin_allotment_id": cabin_allotment_id,
         "customer_pax": pax,
         "gratuity_charge_id": None,
         "itinerary_id": itinerary_id,
-        "non_member_surcharge_id": non_member_surcharge_id,
         "record_updated_time": record_updated_time,
     }
+    if non_member_surcharge_id is not None:
+        draft_payload["non_member_surcharge_id"] = non_member_surcharge_id
 
     headers = _cruise_payment_headers(access_token)
     draft_url = f"{CRUISE_BACKEND_BASE}/customers/v2/booking/draft"
@@ -2026,7 +2127,20 @@ def _book_and_paylink_with_people(
 
     latest_record_updated_time = _extract_record_updated_time(booking_summary, record_updated_time)
     if not latest_record_updated_time:
-        return {"ok": False, "error": "\u7121\u6cd5\u53d6\u5f97 recordUpdatedTime"}, 502
+        r = requests.get(booking_url, headers=headers, timeout=20)
+        if r.status_code == 401:
+            trigger_relogin("booking-refresh", f"status={r.status_code}")
+            _log_backend_response(trace_id, "booking-refresh", r)
+            return {"ok": False, "error": "Token \u5df2\u904e\u671f\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66"}, 401
+        r.raise_for_status()
+        booking_payload = _parse_json_response(r) or {}
+        if isinstance(booking_payload, dict) and isinstance(booking_payload.get("data"), dict):
+            booking_summary = booking_payload.get("data")
+        else:
+            booking_summary = booking_payload if isinstance(booking_payload, dict) else {}
+        latest_record_updated_time = _extract_record_updated_time(booking_summary, None)
+        if not latest_record_updated_time:
+            return {"ok": False, "error": "\u7121\u6cd5\u53d6\u5f97 recordUpdatedTime\uff0c\u8acb\u91cd\u8a66"}, 400
 
     main_passenger, companions, emergency, err = _resolve_passengers_and_emergency(
         access_token, numeric_id, latest_record_updated_time, names
@@ -2067,9 +2181,24 @@ def _book_and_paylink_with_people(
         booking_summary = booking_payload if isinstance(booking_payload, dict) else {}
     latest_record_updated_time = _extract_record_updated_time(booking_summary, latest_record_updated_time)
     if not latest_record_updated_time:
-        return {"ok": False, "error": "\u7121\u6cd5\u53d6\u5f97 recordUpdatedTime"}, 502
+        r = requests.get(booking_url, headers=headers, timeout=20)
+        if r.status_code == 401:
+            trigger_relogin("booking-refresh", f"status={r.status_code}")
+            _log_backend_response(trace_id, "booking-refresh", r)
+            return {"ok": False, "error": "Token \u5df2\u904e\u671f\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66"}, 401
+        r.raise_for_status()
+        booking_payload = _parse_json_response(r) or {}
+        if isinstance(booking_payload, dict) and isinstance(booking_payload.get("data"), dict):
+            booking_summary = booking_payload.get("data")
+        else:
+            booking_summary = booking_payload if isinstance(booking_payload, dict) else {}
+        latest_record_updated_time = _extract_record_updated_time(booking_summary, None)
+        if not latest_record_updated_time:
+            return {"ok": False, "error": "\u7121\u6cd5\u53d6\u5f97 recordUpdatedTime\uff0c\u8acb\u91cd\u8a66"}, 400
 
-    payment_method = _normalize_payment_method("credit_card") or []
+    payment_method = _build_payment_items("credit_card", include_surcharge=non_member_surcharge_id is not None)
+    if not payment_method:
+        return {"ok": False, "error": "invalid payment_method"}, 400
     paylink_entry = create_paylink_entry(
         booking_id=numeric_id,
         record_updated_time=latest_record_updated_time,
