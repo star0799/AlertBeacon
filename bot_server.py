@@ -58,7 +58,7 @@ PRIVATE_PEOPLE_FILE = os.path.join(STATE_DIR, "private_people.json")
 CRUISE_BACKEND_BASE = "https://backend-prd.b2m.stardreamcruises.com"
 
 _latest_recaptcha = {"token": None, "at": None, "action": None}
-_latest_tokens = {"accessToken": None, "refreshToken": None, "user": None, "at": None}
+_latest_tokens = {"accessToken": None, "refreshToken": None, "user": None, "user_mmid": None, "at": None}
 CRUISE_RELOGIN_NEEDED = False
 LAST_RELOGIN_ALERT_AT = 0.0
 LAST_RECOVER_ALERT_AT = 0.0
@@ -71,10 +71,17 @@ def cruise_tokens():
     global CRUISE_RELOGIN_NEEDED, LAST_RECOVER_ALERT_AT
     was_missing = not (_latest_tokens.get("accessToken") and _latest_tokens.get("refreshToken"))
     prev_access = _latest_tokens.get("accessToken")
+    user_val = data.get("user")
+    user_mmid = data.get("mmid") or data.get("user_mmid")
+    if not user_mmid and isinstance(user_val, dict):
+        user_mmid = user_val.get("mmid") or user_val.get("user_mmid") or user_val.get("username")
+    if not user_mmid and isinstance(user_val, str) and user_val.strip():
+        user_mmid = user_val.strip()
     _latest_tokens.update({
         "accessToken": data["accessToken"],
         "refreshToken": data["refreshToken"],
-        "user": data.get("user"),
+        "user": user_val,
+        "user_mmid": user_mmid,
         "at": data.get("at"),
     })
     write_json(TOKENS_CACHE_FILE, _latest_tokens)
@@ -528,7 +535,7 @@ def cruise_recaptcha_get():
 
 @app.post("/cruise/tokens/clear")
 def cruise_tokens_clear():
-    _latest_tokens.update({"accessToken": None, "refreshToken": None, "user": None, "at": None})
+    _latest_tokens.update({"accessToken": None, "refreshToken": None, "user": None, "user_mmid": None, "at": None})
     write_json(TOKENS_CACHE_FILE, _latest_tokens)  # 若你做了持久化
     return jsonify({"ok": True})
 # ------------------------------------------------------
@@ -617,7 +624,7 @@ def trigger_relogin(reason: str, detail: str = "") -> None:
             except Exception as e:
                 print(f"[{ts()}] [CRUISE] relogin notify failed:", uid, repr(e), flush=True)
 
-    _latest_tokens.update({"accessToken": None, "refreshToken": None, "user": None, "at": None})
+    _latest_tokens.update({"accessToken": None, "refreshToken": None, "user": None, "user_mmid": None, "at": None})
     write_json(TOKENS_CACHE_FILE, _latest_tokens)
     CRUISE_RELOGIN_NEEDED = True
 
@@ -1378,6 +1385,15 @@ def _normalize_phone_digits(value: str) -> str:
     if not isinstance(value, str):
         return value
     return re.sub(r"[^\d]", "", value)
+
+
+def _mask_id(value: str | int | None, keep: int = 5) -> str:
+    if value is None:
+        return ""
+    s = str(value)
+    if len(s) <= keep:
+        return s
+    return s[:keep] + "***"
 
 
 def _validate_mmid(access_token: str, mmid: str, booking_id: int, record_updated_time: str) -> tuple[bool, dict | str]:
@@ -2335,6 +2351,35 @@ def handle_cruise_message(event):
             reply = "\u4eba\u540d\u6578\u4e0d\u8db3\uff0c\u9700\u8981\u4e3b\u4e58\u5ba2 + \u7dca\u6025\u806f\u7d61\u4eba"
             cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
             return
+
+        people_list, _ = _load_private_people()
+        selected_main = _match_alias(names[0], people_list)
+        if not selected_main:
+            reply = f"\u627e\u4e0d\u5230\u4e3b\u4e58\u5ba2\uff1a{names[0]}"
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
+        current_user = _latest_tokens.get("user_mmid")
+        if not current_user:
+            user_val = _latest_tokens.get("user")
+            if isinstance(user_val, dict):
+                current_user = user_val.get("mmid") or user_val.get("user_mmid") or user_val.get("username")
+            elif isinstance(user_val, str) and user_val.strip():
+                current_user = user_val.strip()
+        if not current_user:
+            reply = "\u76ee\u524d\u5c1a\u672a\u53d6\u5f97\u767b\u5165\u5e33\u865f\u8cc7\u8a0a\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66"
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
+        main_is_member = bool(selected_main.get("is_member"))
+        main_mmid = selected_main.get("mmid")
+        if main_is_member and main_mmid:
+            if str(main_mmid) != str(current_user):
+                reply = (
+                    "\u76ee\u524d\u767b\u5165\u5e33\u865f\u8207\u4e3b\u4e58\u5ba2\u4e0d\u4e00\u81f4"
+                    f"\uff08\u767b\u5165\uff1a{_mask_id(current_user)}\uff0c\u4e3b\u4e58\u5ba2\uff1a{_mask_id(main_mmid)}\uff09\uff0c"
+                    "\u8acb\u5207\u63db\u767b\u5165\u6216\u66f4\u63db\u4e3b\u4e58\u5ba2\u4ee3\u865f"
+                )
+                cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+                return
 
         trace_id = _make_trace_id()
         result, status = _book_and_paylink_with_people(
