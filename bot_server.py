@@ -1918,7 +1918,7 @@ def process_cruise_text_command(
                 for chunk in _split_line_messages(summary):
                     messages.append(TextSendMessage(text=chunk))
             if pay_url:
-                messages.append(TextSendMessage(text=f"前往付款：{pay_url}"))
+                messages.append(TextSendMessage(text=f"👉 前往付款：{pay_url}"))
             if messages:
                 if reply_token:
                     cruise_line_bot_api.reply_message(reply_token, messages[:5])
@@ -2040,7 +2040,7 @@ def process_cruise_text_command(
             for chunk in _split_line_messages(summary):
                 messages.append(TextSendMessage(text=chunk))
         if pay_url:
-            messages.append(TextSendMessage(text=f"前往付款：{pay_url}"))
+            messages.append(TextSendMessage(text=f"👉 前往付款：{pay_url}"))
         if messages:
             if reply_token:
                 cruise_line_bot_api.reply_message(reply_token, messages[:5])
