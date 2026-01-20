@@ -13,7 +13,7 @@ import time
 import requests
 import secrets
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from filelock import FileLock
 
@@ -1095,6 +1095,22 @@ def _build_payment_items(method_value, include_surcharge: bool) -> list | None:
 def _make_trace_id() -> str:
     return f"{int(time.time())}-{secrets.token_hex(3)}"
 
+_RECORD_UPDATED_TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+
+def _gen_record_updated_time() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _looks_like_record_updated_time(v: str | None) -> bool:
+    return isinstance(v, str) and bool(_RECORD_UPDATED_TIME_RE.match(v.strip()))
+
+
+def _ensure_record_updated_time(v: str | None) -> str:
+    if _looks_like_record_updated_time(v):
+        return v.strip()
+    return _gen_record_updated_time()
+
 
 def _extract_record_updated_time(summary: dict, fallback: str | None) -> str | None:
     for key in ("recordUpdatedTime", "record_updated_time", "record_updated_at", "updated_at"):
@@ -1202,7 +1218,7 @@ def _book_and_paylink_flow(data: dict, base_url: str, trace_id: str) -> tuple[di
     customer_pax = to_int(data.get("customer_pax"))
     itinerary_id = to_int(data.get("itinerary_id"))
     non_member_surcharge_id = to_int_or_none(data.get("non_member_surcharge_id"))
-    record_updated_time = data.get("record_updated_time")
+    record_updated_time = data.get("record_updated_time") or data.get("recordUpdatedTime")
 
     missing = []
     if cabin_allotment_id <= 0:
@@ -1211,10 +1227,10 @@ def _book_and_paylink_flow(data: dict, base_url: str, trace_id: str) -> tuple[di
         missing.append("customer_pax")
     if itinerary_id <= 0:
         missing.append("itinerary_id")
-    if not isinstance(record_updated_time, str) or not record_updated_time.strip():
-        missing.append("record_updated_time")
     if missing:
         return {"ok": False, "error": f"缺少必要欄位: {', '.join(missing)}"}, 400
+
+    record_updated_time = _ensure_record_updated_time(record_updated_time)
 
     payment_method = _build_payment_items(
         data.get("payment_method"),
@@ -1226,6 +1242,7 @@ def _book_and_paylink_flow(data: dict, base_url: str, trace_id: str) -> tuple[di
     ttl_seconds = _normalize_ttl_seconds(data.get("ttl_seconds", 600))
     headers = _cruise_payment_headers(access_token)
 
+    print(f"[{ts()}] [CRUISE] trace={trace_id} draft record_updated_time={record_updated_time}", flush=True)
     draft_payload = {
         "cabin_allotment_id": cabin_allotment_id,
         "customer_pax": customer_pax,
@@ -2215,9 +2232,7 @@ def _book_and_paylink_with_people(
         non_member_surcharge_id = None
     if non_member_surcharge_id is not None and non_member_surcharge_id <= 0:
         non_member_surcharge_id = None
-    record_updated_time = allotment.get("record_updated_time")
-    if not isinstance(record_updated_time, str) or not record_updated_time.strip():
-        return {"ok": False, "error": "\u7f3a\u5c11 record_updated_time\uff0c\u7121\u6cd5\u5efa\u7acb draft"}, 400
+    record_updated_time = _ensure_record_updated_time(None)
 
     draft_payload = {
         "cabin_allotment_id": cabin_allotment_id,
