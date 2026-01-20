@@ -1450,6 +1450,76 @@ def _match_fc_person(fc_list: list, fc_match: dict) -> dict | None:
     return None
 
 
+def _normalize_name_value(value: str | None) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip().lower()
+
+
+def _find_fc_matches(
+    fc_list: list,
+    token: str,
+    hints: dict | None,
+) -> tuple[dict | None, str | None]:
+    if not isinstance(fc_list, list):
+        return None, "找不到該乘客的親友資料，請先加入常用旅客或補 private_people.json"
+    hints = hints or {}
+    token_norm = _normalize_name_value(token)
+
+    chinese = _normalize_name_value(hints.get("chinese_name")) or token_norm
+    given = _normalize_name_value(hints.get("first_name"))
+    surname = _normalize_name_value(hints.get("last_name"))
+    passport = _normalize_name_value(hints.get("passport_number"))
+    dob = _normalize_name_value(hints.get("date_of_birth"))
+
+    if token_norm and (" " in token_norm or "-" in token_norm):
+        parts = [p for p in re.split(r"[\s]+", token_norm) if p]
+        if len(parts) >= 2 and not (given and surname):
+            given = given or parts[0]
+            surname = surname or parts[-1]
+
+    def match_by(field: str, value: str) -> list:
+        if not value:
+            return []
+        matches = []
+        for p in fc_list:
+            v = _normalize_name_value(p.get(field))
+            if v and v == value:
+                matches.append(p)
+        return matches
+
+    matches = match_by("chinese_name", chinese)
+    if matches:
+        if len(matches) > 1:
+            return None, "乘客資料不只一筆，請提供更完整資料以辨識"
+        return matches[0], None
+
+    if given and surname:
+        matches = [
+            p for p in fc_list
+            if _normalize_name_value(p.get("given_name")) == given
+            and _normalize_name_value(p.get("surname")) == surname
+        ]
+        if matches:
+            if len(matches) > 1:
+                return None, "乘客資料不只一筆，請提供更完整資料以辨識"
+            return matches[0], None
+
+    matches = match_by("passport_number", passport)
+    if matches:
+        if len(matches) > 1:
+            return None, "乘客資料不只一筆，請提供更完整資料以辨識"
+        return matches[0], None
+
+    matches = match_by("date_of_birth", dob)
+    if matches:
+        if len(matches) > 1:
+            return None, "乘客資料不只一筆，請提供更完整資料以辨識"
+        return matches[0], None
+
+    return None, "找不到該乘客的親友資料，請先加入常用旅客或補 private_people.json"
+
+
 def _merge_dict(base: dict, override: dict) -> dict:
     merged = dict(base or {})
     for k, v in (override or {}).items():
@@ -1510,9 +1580,22 @@ def _looks_like_mmid(value: str | None) -> bool:
     return re.fullmatch(r"\d+", value.strip()) is not None
 
 
-def _validate_mmid(access_token: str, mmid: str, booking_id: int, record_updated_time: str) -> tuple[bool, dict | str]:
+def _validate_mmid(
+    access_token: str,
+    booking_id: int,
+    record_updated_time: str,
+    mmid_list: list[str] | None = None,
+    fc_ids: list[int] | None = None,
+) -> tuple[bool, dict | str]:
+    if (not mmid_list and not fc_ids) or (mmid_list and fc_ids):
+        return False, "validate-mmid 參數錯誤：請提供 mmid 或 fc_ids"
     url = f"{CRUISE_BACKEND_BASE}/customers/v2/validate-mmid"
-    payload = {"mmid": [mmid], "fc_ids": [], "id": booking_id, "recordUpdatedTime": record_updated_time}
+    payload = {
+        "mmid": [m for m in (mmid_list or []) if m],
+        "fc_ids": [i for i in (fc_ids or []) if i],
+        "id": booking_id,
+        "recordUpdatedTime": record_updated_time,
+    }
     r = requests.post(url, headers=_cruise_payment_headers(access_token), json=payload, timeout=20)
     if r.status_code == 401:
         return False, "Token 已過期，請重新登入 SDC 後再試"
@@ -1835,7 +1918,7 @@ def process_cruise_text_command(
                 for chunk in _split_line_messages(summary):
                     messages.append(TextSendMessage(text=chunk))
             if pay_url:
-                messages.append(TextSendMessage(text=f"👉 前往付款：{pay_url}"))
+                messages.append(TextSendMessage(text=f"前往付款：{pay_url}"))
             if messages:
                 if reply_token:
                     cruise_line_bot_api.reply_message(reply_token, messages[:5])
@@ -1845,13 +1928,18 @@ def process_cruise_text_command(
         return result
 
     parts = raw_text.split()
-    if len(parts) < 5 or parts[-1] != "\u9001\u51fa":
-        result["errors"].append("missing send flag or too few parts")
+    if len(parts) < 5:
+        result["errors"].append(
+            "格式錯誤，請用：\n"
+            "訂房 <日期> <房型> <主乘客> [同行乘客...] <緊急聯絡人>\n"
+            "日期支援：2026-02-22 / 2026/2/22 / 2026.02.22 / 20260222\n"
+            "房型：內側 / 海景 / 露臺 / 陽台（露臺=陽台）"
+        )
         result["error_type"] = "parse_error"
         return result
     date_text = _parse_flexible_date(parts[1])
     tier = _parse_tier(parts[2])
-    names = parts[3:-1]
+    names = parts[3:]
     result["parsed"] = {
         "date": date_text,
         "cabin_type": parts[2],
@@ -1861,7 +1949,7 @@ def process_cruise_text_command(
         "send_flag": True,
     }
     if not date_text:
-        result["errors"].append("invalid date format")
+        result["errors"].append("日期格式錯誤")
         result["error_type"] = "parse_error"
         return result
     if not tier:
@@ -1869,7 +1957,12 @@ def process_cruise_text_command(
         result["error_type"] = "parse_error"
         return result
     if len(names) < 2:
-        result["errors"].append("insufficient passenger names")
+        result["errors"].append(
+            "格式錯誤，請用：\n"
+            "訂房 <日期> <房型> <主乘客> [同行乘客...] <緊急聯絡人>\n"
+            "日期支援：2026-02-22 / 2026/2/22 / 2026.02.22 / 20260222\n"
+            "房型：內側 / 海景 / 露臺 / 陽台（露臺=陽台）"
+        )
         result["error_type"] = "parse_error"
         return result
 
@@ -1898,12 +1991,8 @@ def process_cruise_text_command(
         result["error_type"] = "parse_error"
         return result
     current_user = _latest_tokens.get("user_mmid")
-    if not current_user:
-        user_val = _latest_tokens.get("user")
-        if isinstance(user_val, dict):
-            current_user = user_val.get("mmid") or user_val.get("user_mmid") or user_val.get("username")
-        elif isinstance(user_val, str) and user_val.strip():
-            current_user = user_val.strip()
+    if not _looks_like_mmid(current_user):
+        current_user = None
     if not current_user:
         result["errors"].append("\u76ee\u524d\u5c1a\u672a\u53d6\u5f97\u767b\u5165\u5e33\u865f\u8cc7\u8a0a\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66")
         result["error_type"] = "relogin_required"
@@ -1951,7 +2040,7 @@ def process_cruise_text_command(
             for chunk in _split_line_messages(summary):
                 messages.append(TextSendMessage(text=chunk))
         if pay_url:
-            messages.append(TextSendMessage(text=f"👉 前往付款：{pay_url}"))
+            messages.append(TextSendMessage(text=f"前往付款：{pay_url}"))
         if messages:
             if reply_token:
                 cruise_line_bot_api.reply_message(reply_token, messages[:5])
@@ -1967,70 +2056,136 @@ def _resolve_passengers_and_emergency(
     names: list[str],
 ) -> tuple[dict | None, list | None, dict | None, str | None]:
     people, emergencies = _load_private_people()
-    fc_list, customer_mmid = _fetch_fc_list(access_token)
+
+    booking_summary = fetch_booking_summary(access_token, numeric_id) or {}
+    latest_record_updated_time = _extract_record_updated_time(booking_summary, record_updated_time)
+    if not latest_record_updated_time:
+        return None, None, None, "無法取得 recordUpdatedTime，請重試"
+
+    def current_user_mmid() -> str | None:
+        mmid = _latest_tokens.get("user_mmid")
+        if _looks_like_mmid(mmid):
+            return str(mmid)
+        return None
+
+    fc_list = None
+
+    def get_fc_list():
+        nonlocal fc_list
+        if fc_list is None:
+            fc_list, _ = _fetch_fc_list(access_token)
+        return fc_list
+
+    def merge_validate_fields(base: dict, result: dict):
+        if not isinstance(result, dict):
+            return base
+        if not base.get("date_of_birth") and result.get("dob"):
+            base["date_of_birth"] = result.get("dob")
+        if not base.get("gender") and result.get("gender"):
+            base["gender"] = result.get("gender")
+        if not base.get("email") and result.get("email"):
+            base["email"] = result.get("email")
+        if not base.get("phone_number") and result.get("phone_number"):
+            base["phone_number"] = result.get("phone_number")
+        return base
 
     main_token = names[0]
     companion_tokens = names[1:-1]
     emergency_token = names[-1]
 
-    def build_passenger(token: str, label: str) -> tuple[dict | None, str | None]:
+    def build_passenger(token: str, label: str, is_main: bool) -> tuple[dict | None, str | None]:
         entry = _match_alias(token, people)
-        if not entry:
-            return None, f"\u627e\u4e0d\u5230\u4e58\u5ba2\u8cc7\u6599\uff1a{label}({token})"
-        passenger = entry.get("passenger") if isinstance(entry.get("passenger"), dict) else {}
-        overrides = entry.get("passenger_overrides") if isinstance(entry.get("passenger_overrides"), dict) else {}
-        fc_match = entry.get("fc_match") if isinstance(entry.get("fc_match"), dict) else None
-        is_member = bool(entry.get("is_member"))
-        mmid = entry.get("mmid") if is_member else None
-        base = dict(passenger)
-        if fc_match:
-            fc_person = _match_fc_person(fc_list, fc_match)
-            if fc_person:
-                base = _merge_dict(_map_fc_to_passenger(fc_person), base)
-        base = _merge_dict(base, overrides)
-
-        if is_member:
+        if entry and bool(entry.get("is_member")):
+            mmid = entry.get("mmid")
             if not isinstance(mmid, str) or not mmid.strip():
-                return None, "\u6703\u54e1\u4e58\u5ba2\u7f3a\u5c11 mmid\uff0c\u8acb\u5728 private_people.json \u88dc\u9f4a"
-            ok, result = _validate_mmid(access_token, mmid, numeric_id, record_updated_time)
+                return None, "會員乘客缺少 mmid，請在 private_people.json 補齊"
+            if is_main:
+                current = current_user_mmid()
+                if current and str(mmid) != str(current):
+                    return None, "主乘客會員 MMID 與目前登入帳號不一致，請用正確帳號登入後再下單。"
+
+            passenger = entry.get("passenger") if isinstance(entry.get("passenger"), dict) else {}
+            overrides = entry.get("passenger_overrides") if isinstance(entry.get("passenger_overrides"), dict) else {}
+            base = _merge_dict(passenger, overrides)
+            ok, result = _validate_mmid(
+                access_token,
+                numeric_id,
+                latest_record_updated_time,
+                mmid_list=[mmid],
+                fc_ids=[],
+            )
             if not ok:
-                return None, f"\u6703\u54e1\u9a57\u8b49\u5931\u6557\uff1a{mmid} {result}"
-            if isinstance(result, dict):
-                base = _merge_dict(base, {
-                    "date_of_birth": result.get("dob") or base.get("date_of_birth"),
-                    "gender": result.get("gender") or base.get("gender"),
-                    "email": result.get("email") or base.get("email"),
-                    "phone_number": _normalize_phone_digits(result.get("phone_number") or base.get("phone_number")),
-                })
+                return None, f"會員驗證失敗：{mmid} {result}"
+            base = merge_validate_fields(base, result if isinstance(result, dict) else {})
+        else:
+            if is_main:
+                return None, "主乘客必須為會員，請在 private_people.json 設定 is_member=true"
+            try:
+                fc_list_local = get_fc_list()
+            except PermissionError:
+                return None, "Token 已過期，請重新登入 SDC 後再試"
+
+            overrides = {}
+            hints = {}
+            if entry:
+                if isinstance(entry.get("passenger"), dict):
+                    hints = dict(entry.get("passenger"))
+                if isinstance(entry.get("passenger_overrides"), dict):
+                    overrides = dict(entry.get("passenger_overrides"))
+                    hints = _merge_dict(hints, overrides)
+
+            fc_person, err = _find_fc_matches(fc_list_local, token, hints)
+            if err:
+                return None, err
+            fc_id = fc_person.get("id")
+            if not fc_id:
+                return None, "找不到該乘客的親友資料，請先加入常用旅客或補 private_people.json"
+
+            base = _map_fc_to_passenger(fc_person)
+            if overrides:
+                base = _merge_dict(base, overrides)
+
+            ok, result = _validate_mmid(
+                access_token,
+                numeric_id,
+                latest_record_updated_time,
+                mmid_list=[],
+                fc_ids=[int(fc_id)],
+            )
+            if not ok:
+                return None, f"常用旅客驗證失敗：{result}"
+            base = merge_validate_fields(base, result if isinstance(result, dict) else {})
 
         base["gender"] = _normalize_gender(base.get("gender"))
+        if base.get("phone_number"):
+            base["phone_number"] = _normalize_phone_digits(base.get("phone_number"))
         if not base.get("nationality"):
             base["nationality"] = "TW"
         if base.get("email"):
             base["re-email"] = base.get("email")
         missing = _require_fields(base, label)
         if missing:
-            return None, "\u7f3a\u5c11\u5fc5\u586b\u6b04\u4f4d\uff1a" + ", ".join(missing)
+            return None, "缺少必填欄位：" + ", ".join(missing)
         return base, None
 
-    main_passenger, err = build_passenger(main_token, "\u4e3b\u4e58\u5ba2")
+    main_passenger, err = build_passenger(main_token, "\u4e3b\u4e58\u5ba2", True)
     if err:
         return None, None, None, err
 
     companions = []
     for idx, token in enumerate(companion_tokens, 1):
-        passenger, err = build_passenger(token, f"\u540c\u884c{idx}")
+        passenger, err = build_passenger(token, f"\u540c\u884c{idx+1}", False)
         if err:
             return None, None, None, err
         companions.append(passenger)
 
     emergency_entry = _match_alias(emergency_token, emergencies)
     if not emergency_entry:
-        return None, None, None, f"\u627e\u4e0d\u5230\u7dca\u6025\u806f\u7d61\u4eba\uff1a{emergency_token}"
+        return None, None, None, f"找不到緊急聯絡人：{emergency_token}"
     emergency = emergency_entry.get("emergency_contact") if isinstance(emergency_entry.get("emergency_contact"), dict) else {}
     missing_emg = _require_emergency_fields(emergency)
     if missing_emg:
-        return None, None, None, "\u7dca\u6025\u806f\u7d61\u4eba\u7f3a\u6b04\uff1a" + ", ".join(missing_emg)
+        return None, None, None, "緊急聯絡人缺少必要欄位：" + ", ".join(missing_emg)
 
     return main_passenger, companions, emergency, None
 
