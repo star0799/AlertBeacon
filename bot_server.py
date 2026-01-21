@@ -4,7 +4,7 @@ from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from flask import Flask, request, jsonify
 import html
-
+import re
 import os
 import sys
 import json
@@ -58,7 +58,14 @@ PRIVATE_PEOPLE_FILE = os.path.join(STATE_DIR, "private_people.json")
 CRUISE_BACKEND_BASE = "https://backend-prd.b2m.stardreamcruises.com"
 
 _latest_recaptcha = {"token": None, "at": None, "action": None}
-_latest_tokens = {"accessToken": None, "refreshToken": None, "user": None, "user_mmid": None, "at": None}
+_latest_tokens = {
+    "accessToken": None,
+    "refreshToken": None,
+    "user": None,
+    "customer_id": None,
+    "user_mmid": None,
+    "at": None,
+}
 CRUISE_RELOGIN_NEEDED = False
 LAST_RELOGIN_ALERT_AT = 0.0
 LAST_RECOVER_ALERT_AT = 0.0
@@ -72,20 +79,21 @@ def cruise_tokens():
     was_missing = not (_latest_tokens.get("accessToken") and _latest_tokens.get("refreshToken"))
     prev_access = _latest_tokens.get("accessToken")
     user_val = data.get("user")
-    user_mmid = None
-    cand = data.get("mmid") or data.get("user_mmid")
-    if _looks_like_mmid(cand):
-        user_mmid = cand.strip()
-    if not user_mmid and isinstance(user_val, dict):
-        cand = user_val.get("mmid")
-        if _looks_like_mmid(cand):
-            user_mmid = cand.strip()
-    if not user_mmid and isinstance(user_val, str) and _looks_like_mmid(user_val):
-        user_mmid = user_val.strip()
+    customer_id = None
+    if isinstance(user_val, dict):
+        sub = user_val.get("sub")
+        if isinstance(sub, (str, int)) and str(sub).strip().isdigit():
+            customer_id = str(sub).strip()
+    elif isinstance(user_val, str) and user_val.strip().isdigit():
+        customer_id = user_val.strip()
+    user_mmid = _latest_tokens.get("user_mmid")
+    if prev_access != data.get("accessToken"):
+        user_mmid = None
     _latest_tokens.update({
         "accessToken": data["accessToken"],
         "refreshToken": data["refreshToken"],
         "user": user_val,
+        "customer_id": customer_id,
         "user_mmid": user_mmid,
         "at": data.get("at"),
     })
@@ -580,7 +588,14 @@ def cruise_recaptcha_get():
 
 @app.post("/cruise/tokens/clear")
 def cruise_tokens_clear():
-    _latest_tokens.update({"accessToken": None, "refreshToken": None, "user": None, "user_mmid": None, "at": None})
+    _latest_tokens.update({
+        "accessToken": None,
+        "refreshToken": None,
+        "user": None,
+        "customer_id": None,
+        "user_mmid": None,
+        "at": None,
+    })
     write_json(TOKENS_CACHE_FILE, _latest_tokens)  # 若你做了持久化
     return jsonify({"ok": True})
 # ------------------------------------------------------
@@ -669,7 +684,14 @@ def trigger_relogin(reason: str, detail: str = "") -> None:
             except Exception as e:
                 print(f"[{ts()}] [CRUISE] relogin notify failed:", uid, repr(e), flush=True)
 
-    _latest_tokens.update({"accessToken": None, "refreshToken": None, "user": None, "user_mmid": None, "at": None})
+    _latest_tokens.update({
+        "accessToken": None,
+        "refreshToken": None,
+        "user": None,
+        "customer_id": None,
+        "user_mmid": None,
+        "at": None,
+    })
     write_json(TOKENS_CACHE_FILE, _latest_tokens)
     CRUISE_RELOGIN_NEEDED = True
 
@@ -1597,6 +1619,13 @@ def _looks_like_mmid(value: str | None) -> bool:
     return re.fullmatch(r"\d+", value.strip()) is not None
 
 
+def set_current_user_mmid(mmid: str) -> None:
+    if not isinstance(mmid, str) or not mmid.strip().isdigit():
+        return
+    _latest_tokens["user_mmid"] = mmid.strip()
+    write_json(TOKENS_CACHE_FILE, _latest_tokens)
+
+
 def _validate_mmid(
     access_token: str,
     booking_id: int,
@@ -2010,13 +2039,9 @@ def process_cruise_text_command(
     current_user = _latest_tokens.get("user_mmid")
     if not _looks_like_mmid(current_user):
         current_user = None
-    if not current_user:
-        result["errors"].append("\u76ee\u524d\u5c1a\u672a\u53d6\u5f97\u767b\u5165\u5e33\u865f\u8cc7\u8a0a\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66")
-        result["error_type"] = "relogin_required"
-        return result
     main_is_member = bool(selected_main.get("is_member"))
     main_mmid = selected_main.get("mmid")
-    if main_is_member and main_mmid and str(main_mmid) != str(current_user):
+    if main_is_member and main_mmid and current_user and str(main_mmid) != str(current_user):
         result["errors"].append("\u4e3b\u4e58\u5ba2\u7684\u6703\u54e1 MMID \u8207\u76ee\u524d\u767b\u5165\u7684\u5e33\u865f\u4e0d\u4e00\u81f4\uff0c\u8acb\u5148\u7528\u6b63\u78ba\u5e33\u865f\u767b\u5165\u5f8c\u518d\u4e0b\u55ae\u3002")
         result["error_type"] = "auth_mismatch"
         return result
@@ -2116,6 +2141,9 @@ def _resolve_passengers_and_emergency(
             mmid = entry.get("mmid")
             if not isinstance(mmid, str) or not mmid.strip():
                 return None, "會員乘客缺少 mmid，請在 private_people.json 補齊"
+            cust = _latest_tokens.get("customer_id")
+            if cust and str(mmid) == str(cust):
+                return None, "private_people.json \u7684 mmid \u7591\u4f3c\u586b\u5230 customer_id(sub)\uff0c\u8acb\u6539\u6210\u771f\u6b63\u6703\u54e1 mmid"
             if is_main:
                 current = current_user_mmid()
                 if current and str(mmid) != str(current):
@@ -2134,6 +2162,8 @@ def _resolve_passengers_and_emergency(
             if not ok:
                 return None, f"會員驗證失敗：{mmid} {result}"
             base = merge_validate_fields(base, result if isinstance(result, dict) else {})
+            if is_main:
+                set_current_user_mmid(mmid)
         else:
             if is_main:
                 return None, "主乘客必須為會員，請在 private_people.json 設定 is_member=true"
