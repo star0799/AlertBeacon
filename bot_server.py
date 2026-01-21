@@ -1271,9 +1271,8 @@ def _book_and_paylink_flow(data: dict, base_url: str, trace_id: str) -> tuple[di
         "gratuity_charge_id": None,
         "itinerary_id": itinerary_id,
         "record_updated_time": record_updated_time,
+        "non_member_surcharge_id": non_member_surcharge_id,
     }
-    if non_member_surcharge_id is not None:
-        draft_payload["non_member_surcharge_id"] = non_member_surcharge_id
 
     for attempt in range(2):
         draft_url = f"{CRUISE_BACKEND_BASE}/customers/v2/booking/draft"
@@ -2041,10 +2040,6 @@ def process_cruise_text_command(
         current_user = None
     main_is_member = bool(selected_main.get("is_member"))
     main_mmid = selected_main.get("mmid")
-    if main_is_member and main_mmid and current_user and str(main_mmid) != str(current_user):
-        result["errors"].append("\u4e3b\u4e58\u5ba2\u7684\u6703\u54e1 MMID \u8207\u76ee\u524d\u767b\u5165\u7684\u5e33\u865f\u4e0d\u4e00\u81f4\uff0c\u8acb\u5148\u7528\u6b63\u78ba\u5e33\u865f\u767b\u5165\u5f8c\u518d\u4e0b\u55ae\u3002")
-        result["error_type"] = "auth_mismatch"
-        return result
 
     trace_id = _make_trace_id()
     flow_result, status = _book_and_paylink_with_people(
@@ -2141,13 +2136,8 @@ def _resolve_passengers_and_emergency(
             mmid = entry.get("mmid")
             if not isinstance(mmid, str) or not mmid.strip():
                 return None, "會員乘客缺少 mmid，請在 private_people.json 補齊"
-            cust = _latest_tokens.get("customer_id")
-            if cust and str(mmid) == str(cust):
-                return None, "private_people.json \u7684 mmid \u7591\u4f3c\u586b\u5230 customer_id(sub)\uff0c\u8acb\u6539\u6210\u771f\u6b63\u6703\u54e1 mmid"
             if is_main:
                 current = current_user_mmid()
-                if current and str(mmid) != str(current):
-                    return None, "主乘客會員 MMID 與目前登入帳號不一致，請用正確帳號登入後再下單。"
 
             passenger = entry.get("passenger") if isinstance(entry.get("passenger"), dict) else {}
             overrides = entry.get("passenger_overrides") if isinstance(entry.get("passenger_overrides"), dict) else {}
@@ -2287,7 +2277,16 @@ def _book_and_paylink_with_people(
         return {"ok": False, "error": "Token \u5df2\u904e\u671f\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66"}, 401
     if r.status_code >= 400:
         _log_backend_response(trace_id, "draft", r)
-        return {"ok": False, "error": "\u5efa\u7acb\u8349\u7a3f\u5931\u6557\uff0c\u8acb\u7a0d\u5f8c\u91cd\u8a66"}, 502
+        body_head = ""
+        try:
+            body_head = (r.text or "")[:300]
+        except Exception:
+            body_head = ""
+        return {
+            "ok": False,
+            "error": "後端建立草稿失敗，請稍後重試",
+            "debug": {"status": r.status_code, "body_head": body_head}
+        }, 502
 
     draft_data = _parse_json_response(r) or {}
     booking_id = draft_data.get("booking_id")
