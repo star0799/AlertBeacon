@@ -1401,13 +1401,23 @@ def _parse_flexible_date(text: str) -> str | None:
         return None
 
 
+def _normalize_room_token(text: str) -> str:
+    s = (text or "").strip()
+    if s.endswith("\u623f"):
+        s = s[:-1]
+    return s
+
+
 def _parse_tier(text: str) -> int | None:
-    if text in ("\u5167\u5074", "\u5167\u8259"):
-        return 1
-    if text == "\u6d77\u666f":
-        return 2
-    if text in ("\u9732\u53f0", "\u9732\u81fa", "\u967d\u53f0"):
-        return 3
+    ROOM_TIER_MAP = {
+        1: {"\u5167\u5074", "\u5167\u8259"},
+        2: {"\u6d77\u666f"},
+        3: {"\u9732\u53f0", "\u967d\u53f0", "\u9732\u81fa", "\u967d\u81fa"},
+    }
+    token = _normalize_room_token(text)
+    for tier, synonyms in ROOM_TIER_MAP.items():
+        if token in synonyms:
+            return tier
     return None
 
 
@@ -1744,11 +1754,13 @@ def _resolve_allotment(access_token: str, date: str, tier: int, pax: int) -> tup
             for kw in keywords:
                 if kw.lower() in name:
                     return it
-        return items[0] if items else None
+        return None
 
     picked = pick_item()
     if not picked:
-        return None, "\u67e5\u7121\u53ef\u7528\u623f\u578b"
+        TIER_LABEL = {1: "\u5167\u5074", 2: "\u6d77\u666f", 3: "\u9732\u53f0"}
+        label = TIER_LABEL.get(tier, "\u6307\u5b9a")
+        return None, f"\u6c92\u6709{label}\u623f"
 
     try:
         print(f"[{ts()}] [CRUISE] allotment picked keys: {list(picked.keys())}", flush=True)
