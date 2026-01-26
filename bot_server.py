@@ -120,6 +120,14 @@ def cruise_tokens_get():
     return jsonify(_latest_tokens)
 
 
+def _is_missing(v) -> bool:
+    if v is None:
+        return True
+    if isinstance(v, str) and not v.strip():
+        return True
+    return False
+
+
 @app.get("/cruise/pay/<code>")
 def cruise_pay(code: str):
     if not os.path.exists(PAY_LINKS_FILE):
@@ -173,7 +181,7 @@ def cruise_pay(code: str):
         booking_id = entry.get("booking_id")
         record_updated_time = entry.get("recordUpdatedTime")
         payment_method = entry.get("payment_method")
-        if not booking_id or not record_updated_time or not payment_method:
+        if not booking_id or not payment_method:
             return jsonify({"ok": False, "error": "invalid pay_links entry"}), 400
 
         method_map = {
@@ -260,14 +268,80 @@ def cruise_pay(code: str):
         if not normalized_items:
             return jsonify({"ok": False, "error": "invalid payment_method"}), 400
 
+        access_token = _latest_tokens.get("accessToken")
+        if not access_token:
+            return jsonify({"ok": False, "error": "missing access token"}), 401
+
+        try:
+            summary = fetch_booking_summary(access_token, booking_id)
+        except Exception:
+            summary = None
+
+        latest_rut = None
+        if isinstance(summary, dict):
+            latest_rut = _extract_record_updated_time(summary, None)
+
+        if latest_rut and isinstance(latest_rut, str) and latest_rut.strip():
+            latest_rut = latest_rut.strip()
+            if latest_rut != record_updated_time:
+                record_updated_time = latest_rut
+                entry["recordUpdatedTime"] = record_updated_time
+                links[code] = entry
+                write_json_atomic(PAY_LINKS_FILE, links)
+        else:
+            if not record_updated_time:
+                return jsonify({"ok": False, "error": "missing recordUpdatedTime (cannot refresh)"}), 400
+
+        # ----- FC passenger passport completeness check (before payment) -----
+        passenger_list = []
+        if isinstance(summary, dict):
+            if isinstance(summary.get("passenger_list"), list):
+                passenger_list = summary.get("passenger_list")
+            else:
+                cb = summary.get("current_booking") or {}
+                if isinstance(cb, dict) and isinstance(cb.get("passenger_list"), list):
+                    passenger_list = cb.get("passenger_list")
+
+        fc_missing = []
+        passport_keys = [
+            "passport_issuance_country",
+            "passport_number",
+            "passport_issuance_date",
+            "passport_expiry_date",
+        ]
+
+        for idx, p in enumerate(passenger_list, 1):
+            if not isinstance(p, dict):
+                continue
+            p_type = (p.get("type") or "").lower()
+            mmid_val = p.get("mmid")
+            is_fc = (
+                (p_type == "frequent_cruiser")
+                or (mmid_val is None)
+                or (isinstance(mmid_val, str) and mmid_val.strip() == "")
+            )
+            if not is_fc:
+                continue
+
+            missing_keys = [k for k in passport_keys if _is_missing(p.get(k))]
+            if missing_keys:
+                name = p.get("chinese_name") or p.get("full_name") or f"同行{idx}"
+                fc_missing.append({"passenger": name, "missing": missing_keys})
+
+        if fc_missing:
+            resp = jsonify({
+                "ok": False,
+                "error": "親友乘客資料缺少護照資訊，請先到 SDC 常用旅客補齊後再付款",
+                "missing": fc_missing,
+            })
+            resp.headers["Content-Type"] = "application/json; charset=utf-8"
+            return resp, 400
+        # ----- end check -----
+
         # Mark used before calling payment API to prevent replay
         entry["used_at"] = now
         links[code] = entry
         write_json_atomic(PAY_LINKS_FILE, links)
-
-    access_token = get_latest_access_token()
-    if not access_token:
-        return "No access token found. Please login and sync tokens first.", 500
 
     body = {
         "booking_id": booking_id,
@@ -284,19 +358,24 @@ def cruise_pay(code: str):
         endpoint = cs.get("endPoint")
         config = cs.get("config") or {}
         if not endpoint or not isinstance(config, dict) or not config:
-            raise ValueError("missing cybersource response")           
+            raise ValueError("missing cybersource response")
     except requests.HTTPError as ex:
-        # HTTP 4xx/5xx：把後端回的 body 帶出來方便定位
+        # HTTP 4xx/5xx: include response body for debugging
         resp = ex.response
         status = resp.status_code if resp is not None else None
-        detail = ""
+        body_head = ""
+        detail = None
         if resp is not None:
-            # 先試 JSON，失敗就用文字
             try:
-                detail_obj = resp.json()
-                detail = detail_obj
+                detail = resp.json()
+                body_head = json.dumps(detail, ensure_ascii=False)[:1200]
             except Exception:
-                detail = (resp.text or "")[:1200]  # 截短避免太長
+                body_head = (resp.text or "")[:1200]
+                detail = body_head
+        print(
+            f"[{ts()}] [CRUISE] payment failed: status={status} body_head={body_head}",
+            flush=True,
+        )
         # rollback used_at
         lock = FileLock(PAY_LINKS_LOCK)
         with lock:
@@ -309,8 +388,7 @@ def cruise_pay(code: str):
     
         if status in (401, 403):
             trigger_relogin("payment", f"status={status}")
-        err = "payment api failed" if status is None else f"payment api failed ({status})"
-        return jsonify({"ok": False, "error": err, "detail": detail}), 502
+        return jsonify({"ok": False, "error": f"payment api failed ({status})", "detail": detail}), 502
     
     except Exception as ex:
         # timeout / json decode / ValueError 等
