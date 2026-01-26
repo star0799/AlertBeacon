@@ -1663,22 +1663,33 @@ def _validate_mmid(
     return True, data if isinstance(data, dict) else {}
 
 
-def _require_fields(passenger: dict, label: str) -> list:
+def _require_fields(
+    passenger: dict,
+    label: str,
+    require_contact: bool = True,
+    require_passport: bool = True,
+) -> list:
     required = [
         "first_name",
         "last_name",
         "date_of_birth",
         "gender",
         "nationality",
-        "passport_issuance_country",
-        "passport_number",
-        "passport_issuance_date",
-        "passport_expiry_date",
-        "email",
-        "re-email",
-        "phone_country_code",
-        "phone_number",
     ]
+    if require_passport:
+        required += [
+            "passport_issuance_country",
+            "passport_number",
+            "passport_issuance_date",
+            "passport_expiry_date",
+        ]
+    if require_contact:
+        required += [
+            "email",
+            "re-email",
+            "phone_country_code",
+            "phone_number",
+        ]
     missing = []
     for key in required:
         v = passenger.get(key)
@@ -1875,7 +1886,18 @@ def _prepare_passengers_from_private(names: list[str]) -> tuple[dict | None, lis
             base["nationality"] = "TW"
         if base.get("email"):
             base["re-email"] = base.get("email")
-        missing = _require_fields(base, label)
+        if is_main:
+            require_contact = True
+            require_passport = True
+        else:
+            require_contact = False
+            require_passport = is_member
+        missing = _require_fields(
+            base,
+            label,
+            require_contact=require_contact,
+            require_passport=require_passport,
+        )
         if missing:
             errors.append("\u7f3a\u5c11\u5fc5\u586b\u6b04\u4f4d\uff1a" + ", ".join(missing))
             return None
@@ -2144,7 +2166,8 @@ def _resolve_passengers_and_emergency(
 
     def build_passenger(token: str, label: str, is_main: bool) -> tuple[dict | None, str | None]:
         entry = _match_alias(token, people)
-        if entry and bool(entry.get("is_member")):
+        is_member = bool(entry and entry.get("is_member"))
+        if is_member:
             mmid = entry.get("mmid")
             if not isinstance(mmid, str) or not mmid.strip():
                 return None, "會員乘客缺少 mmid，請在 private_people.json 補齊"
@@ -2212,7 +2235,18 @@ def _resolve_passengers_and_emergency(
             base["nationality"] = "TW"
         if base.get("email"):
             base["re-email"] = base.get("email")
-        missing = _require_fields(base, label)
+        if is_main:
+            require_contact = True
+            require_passport = True
+        else:
+            require_contact = False
+            require_passport = is_member
+        missing = _require_fields(
+            base,
+            label,
+            require_contact=require_contact,
+            require_passport=require_passport,
+        )
         if missing:
             return None, "缺少必填欄位：" + ", ".join(missing)
         return base, None
@@ -2223,7 +2257,7 @@ def _resolve_passengers_and_emergency(
 
     companions = []
     for idx, token in enumerate(companion_tokens, 1):
-        passenger, err = build_passenger(token, f"\u540c\u884c{idx+1}", False)
+        passenger, err = build_passenger(token, f"\u540c\u884c{idx}", False)
         if err:
             return None, None, None, err
         companions.append(passenger)
