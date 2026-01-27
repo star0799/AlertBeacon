@@ -128,6 +128,28 @@ def _is_missing(v) -> bool:
     return False
 
 
+def _get_nested_value(passenger: dict, aliases: list[str]):
+    sources = [
+        passenger,
+        passenger.get("passport"),
+        passenger.get("passportInfo"),
+        passenger.get("passport_info"),
+        passenger.get("personal_information"),
+        passenger.get("personalInfo"),
+        passenger.get("profile"),
+        passenger.get("contact"),
+        passenger.get("contactInfo"),
+        passenger.get("details"),
+    ]
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        for key in aliases:
+            if key in src:
+                return src.get(key)
+    return None
+
+
 @app.get("/cruise/pay/<code>")
 def cruise_pay(code: str):
     if not os.path.exists(PAY_LINKS_FILE):
@@ -292,50 +314,80 @@ def cruise_pay(code: str):
             if not record_updated_time:
                 return jsonify({"ok": False, "error": "missing recordUpdatedTime (cannot refresh)"}), 400
 
-        # ----- FC passenger passport completeness check (before payment) -----
-        passenger_list = []
-        if isinstance(summary, dict):
-            if isinstance(summary.get("passenger_list"), list):
-                passenger_list = summary.get("passenger_list")
-            else:
-                cb = summary.get("current_booking") or {}
-                if isinstance(cb, dict) and isinstance(cb.get("passenger_list"), list):
-                    passenger_list = cb.get("passenger_list")
+        # ----- pay precheck for surcharge (before payment) -----
+        has_surcharge = any(item.get("payment_for") == "Non Member Surcharge" for item in normalized_items)
+        if has_surcharge:
+            passenger_list = []
+            if isinstance(summary, dict):
+                if isinstance(summary.get("passenger_list"), list):
+                    passenger_list = summary.get("passenger_list")
+                else:
+                    cb = summary.get("current_booking") or {}
+                    if isinstance(cb, dict) and isinstance(cb.get("passenger_list"), list):
+                        passenger_list = cb.get("passenger_list")
 
-        fc_missing = []
-        passport_keys = [
-            "passport_issuance_country",
-            "passport_number",
-            "passport_issuance_date",
-            "passport_expiry_date",
-        ]
+            missing_all = []
+            passport_aliases = [
+                "passport_issuance_country",
+                "passportIssuanceCountry",
+                "issuing_country",
+                "issuingCountry",
+            ]
+            for idx, p in enumerate(passenger_list, 1):
+                if not isinstance(p, dict):
+                    continue
+                missing_keys = []
+                if _is_missing(_get_nested_value(p, passport_aliases)):
+                    missing_keys.append("passport_issuance_country")
+                if missing_keys:
+                    name = (
+                        p.get("chinese_name")
+                        or p.get("full_name")
+                        or p.get("first_name")
+                        or p.get("given_name")
+                        or f"同行{idx}"
+                    )
+                    p_type = p.get("type") or ""
+                    missing_all.append({
+                        "passenger": name,
+                        "type": p_type,
+                        "missing": missing_keys,
+                    })
 
-        for idx, p in enumerate(passenger_list, 1):
-            if not isinstance(p, dict):
-                continue
-            p_type = (p.get("type") or "").lower()
-            mmid_val = p.get("mmid")
-            is_fc = (
-                (p_type == "frequent_cruiser")
-                or (mmid_val is None)
-                or (isinstance(mmid_val, str) and mmid_val.strip() == "")
-            )
-            if not is_fc:
-                continue
+            if missing_all:
+                print(
+                    f"[{ts()}] [CRUISE] pay precheck note: passport_issuance_country missing in passenger_list={missing_all} booking_id={booking_id}",
+                    flush=True,
+                )
 
-            missing_keys = [k for k in passport_keys if _is_missing(p.get(k))]
-            if missing_keys:
-                name = p.get("chinese_name") or p.get("full_name") or f"同行{idx}"
-                fc_missing.append({"passenger": name, "missing": missing_keys})
+            main_passenger = None
+            if isinstance(summary, dict):
+                if isinstance(summary.get("main_passenger"), dict):
+                    main_passenger = summary.get("main_passenger")
+                else:
+                    cb = summary.get("current_booking") or {}
+                    if isinstance(cb, dict) and isinstance(cb.get("main_passenger"), dict):
+                        main_passenger = cb.get("main_passenger")
 
-        if fc_missing:
-            resp = jsonify({
-                "ok": False,
-                "error": "親友乘客資料缺少護照資訊，請先到 SDC 常用旅客補齊後再付款",
-                "missing": fc_missing,
-            })
-            resp.headers["Content-Type"] = "application/json; charset=utf-8"
-            return resp, 400
+            phone_aliases = ["phone_number", "phoneNumber"]
+            if _is_missing(_get_nested_value(main_passenger or {}, phone_aliases)):
+                resp = jsonify({
+                    "ok": False,
+                    "error": "主乘客缺電話，請補齊後再試",
+                })
+                resp.headers["Content-Type"] = "application/json; charset=utf-8"
+                return resp, 400
+
+            if passenger_list:
+                if all(
+                    _is_missing(_get_nested_value(p, phone_aliases))
+                    for p in passenger_list
+                    if isinstance(p, dict)
+                ):
+                    print(
+                        f"[{ts()}] [CRUISE] precheck note: pax phone_number not present in booking passenger_list; only validate main_passenger",
+                        flush=True,
+                    )
         # ----- end check -----
 
         # Mark used before calling payment API to prevent replay
@@ -343,13 +395,32 @@ def cruise_pay(code: str):
         links[code] = entry
         write_json_atomic(PAY_LINKS_FILE, links)
 
+    def _norm_payment_for(s: str) -> str:
+        return (s or "").strip().lower().replace("_", " ")
+
+    items_to_payment = []
+    for item in normalized_items:
+        if _norm_payment_for(item.get("payment_for")) == "port charge":
+            items_to_payment = [item]
+            break
+    if not items_to_payment:
+        return jsonify({"ok": False, "error": "missing Port Charge payment item"}), 400
+
+    print(
+        f"[{ts()}] [CRUISE] payment prep: has_surcharge={has_surcharge} "
+        f"items_sent_display={normalized_items} items_to_payment={items_to_payment} "
+        f"rut_final={record_updated_time} booking_id={booking_id}",
+        flush=True,
+    )
+
     body = {
         "booking_id": booking_id,
-        "payment_method": normalized_items,
+        "payment_method": items_to_payment,
         "recordUpdatedTime": record_updated_time,
     }
 
     url = f"{CRUISE_BACKEND_BASE}/customers/v2/booking/payment/{booking_id}"
+
     try:
         r = requests.post(url, headers=_cruise_payment_headers(access_token), json=body, timeout=20)
         r.raise_for_status()
@@ -360,7 +431,6 @@ def cruise_pay(code: str):
         if not endpoint or not isinstance(config, dict) or not config:
             raise ValueError("missing cybersource response")
     except requests.HTTPError as ex:
-        # HTTP 4xx/5xx: include response body for debugging
         resp = ex.response
         status = resp.status_code if resp is not None else None
         body_head = ""
@@ -373,9 +443,11 @@ def cruise_pay(code: str):
                 body_head = (resp.text or "")[:1200]
                 detail = body_head
         print(
-            f"[{ts()}] [CRUISE] payment failed: status={status} body_head={body_head}",
+            f"[{ts()}] [CRUISE] payment failed: attempt=1 status={status} body_head={body_head}",
             flush=True,
         )
+        if status in (401, 403):
+            trigger_relogin("payment", f"status={status}")
         # rollback used_at
         lock = FileLock(PAY_LINKS_LOCK)
         with lock:
@@ -385,13 +457,9 @@ def cruise_pay(code: str):
                 entry2["used_at"] = 0
                 links[code] = entry2
                 write_json_atomic(PAY_LINKS_FILE, links)
-    
-        if status in (401, 403):
-            trigger_relogin("payment", f"status={status}")
         return jsonify({"ok": False, "error": f"payment api failed ({status})", "detail": detail}), 502
-    
     except Exception as ex:
-        # timeout / json decode / ValueError 等
+        # timeout / json decode / ValueError
         lock = FileLock(PAY_LINKS_LOCK)
         with lock:
             links = read_json(PAY_LINKS_FILE, {})
@@ -400,8 +468,7 @@ def cruise_pay(code: str):
                 entry2["used_at"] = 0
                 links[code] = entry2
                 write_json_atomic(PAY_LINKS_FILE, links)
-    
-        return jsonify({"ok": False, "error": f"payment api failed", "detail": str(ex)}), 502        
+        return jsonify({"ok": False, "error": f"payment api failed", "detail": str(ex)}), 502
 
     # Option B: delete entry after successful redirect to keep file clean.
     lock = FileLock(PAY_LINKS_LOCK)
@@ -2203,6 +2270,7 @@ def _resolve_passengers_and_emergency(
     numeric_id: int,
     record_updated_time: str,
     names: list[str],
+    require_phone: bool = False,
 ) -> tuple[dict | None, list | None, dict | None, str | None]:
     people, emergencies = _load_private_people()
 
@@ -2309,10 +2377,18 @@ def _resolve_passengers_and_emergency(
         base["gender"] = _normalize_gender(base.get("gender"))
         if base.get("phone_number"):
             base["phone_number"] = _normalize_phone_digits(base.get("phone_number"))
+        nat = base.get("nationality")
+        if not base.get("passport_issuance_country"):
+            if nat:
+                base["passport_issuance_country"] = nat
+            else:
+                return None, f"{label}缺少 passport_issuance_country"
         if not base.get("nationality"):
             base["nationality"] = "TW"
         if base.get("email"):
             base["re-email"] = base.get("email")
+        if is_main and require_phone and not base.get("phone_number"):
+            return None, "主乘客缺少 phone_number，請到 SDC 常用旅客/會員資料補齊後再試"
         if is_main:
             require_contact = True
             require_passport = True
@@ -2465,8 +2541,9 @@ def _book_and_paylink_with_people(
         if not latest_record_updated_time:
             return {"ok": False, "error": "\u7121\u6cd5\u53d6\u5f97 recordUpdatedTime\uff0c\u8acb\u91cd\u8a66"}, 400
 
+    require_phone = non_member_surcharge_id is not None
     main_passenger, companions, emergency, err = _resolve_passengers_and_emergency(
-        access_token, numeric_id, latest_record_updated_time, names
+        access_token, numeric_id, latest_record_updated_time, names, require_phone=require_phone
     )
     if err:
         return {"ok": False, "error": err}, 400
