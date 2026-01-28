@@ -1042,6 +1042,8 @@ def _full_name(person: dict) -> str:
         return name
     given = person.get("given_name") or person.get("first_name") or ""
     surname = person.get("surname") or person.get("last_name") or ""
+    if given and surname:
+        return f"{given} [{surname}]"
     return " ".join([x for x in [given, surname] if x])
 
 
@@ -1085,12 +1087,10 @@ def build_paylink_summary_text(
         return "\n".join([
             "🧾【付款前二次確認】",
             f"訂單：{booking_id}",
-            f"👉 前往付款：{pay_url}",
-            f"（連結有效 {ttl_minutes} 分鐘）",
+            f"👉 前往付款：{pay_url}（連結有效 {ttl_minutes} 分鐘）",
         ])
 
     summary = booking_summary
-    booking_id_inner = summary.get("booking_id") or ""
     order_id = summary.get("id") or booking_id
     departure_date = summary.get("departure_date") or ""
     arrival_date = summary.get("arrival_date") or ""
@@ -1112,11 +1112,62 @@ def build_paylink_summary_text(
     if not amount:
         amount = _fmt_amount(summary.get("credit_card"))
 
+    def _get_person_value(person: dict, aliases: list[str]):
+        if not isinstance(person, dict):
+            return None
+        containers = [
+            person,
+            person.get("passport"),
+            person.get("passportInfo"),
+            person.get("passport_info"),
+            person.get("personal_information"),
+            person.get("personalInfo"),
+            person.get("profile"),
+            person.get("contact"),
+            person.get("contactInfo"),
+            person.get("details"),
+        ]
+        for src in containers:
+            if not isinstance(src, dict):
+                continue
+            for key in aliases:
+                val = src.get(key)
+                if val is not None and not (isinstance(val, str) and not val.strip()):
+                    return val
+        return None
+
+    def _append_if(lines: list[str], label: str, value) -> None:
+        text = _fmt_field(value)
+        if text != "（未提供）":
+            lines.append(f"  {label}：{text}")
+
+    def _gender_text(v: str) -> str:
+        g = (v or "").strip().lower()
+        if g in ("female", "f", "女"):
+            return "女"
+        if g in ("male", "m", "男"):
+            return "男"
+        return _fmt_field(v)
+
+    def _fmt_date(v):
+        if not v:
+            return "（未提供）"
+        s = str(v)
+        return s.split("T")[0] if "T" in s else s
+
+    passport_issue_aliases = [
+        "passport_issuance_country",
+        "passportIssuanceCountry",
+        "issuing_country",
+        "issuingCountry",
+    ]
+
     main = summary.get("main_passenger") if isinstance(summary.get("main_passenger"), dict) else {}
     main_zh = _fmt_field(_chinese_name(main))
     main_en = _fmt_field(_full_name(main))
-    main_passport = _fmt_field(main.get("passport_number") or main.get("passport"))
+    main_passport = _fmt_field(_get_person_value(main, ["passport_number", "passportNumber", "passport"]))
     main_phone = _fmt_field(_phone_number(main))
+    main_issue_country = _fmt_field(_get_person_value(main, passport_issue_aliases))
 
     emergency = summary.get("emergency_contact") if isinstance(summary.get("emergency_contact"), dict) else {}
     emergency_zh = _fmt_field(_chinese_name(emergency)) if emergency else ""
@@ -1127,20 +1178,37 @@ def build_paylink_summary_text(
     passengers = _extract_passengers(summary)
     passengers_available = bool(passengers)
 
-    def passenger_lines(max_count: int, include_details: bool) -> list[str]:
-        lines = ["同行乘客："]
+    def passenger_lines(max_count: int) -> list[str]:
+        lines = []
         if not passengers_available:
+            lines.append("同行乘客：")
             lines.append("（後端未回傳/尚未完成）")
             return lines
         for idx, p in enumerate(passengers[:max_count], 1):
             zh = _fmt_field(_chinese_name(p))
             en = _fmt_field(_full_name(p))
-            lines.append(f"- 中文名：{zh} / English：{en}")
-            if include_details:
-                passport = _fmt_field(p.get("passport_number") or p.get("passport"))
-                phone = _fmt_field(_phone_number(p))
-                lines.append(f"  護照：{passport}")
-                lines.append(f"  電話：{phone}")
+            passport = _fmt_field(_get_person_value(p, ["passport_number", "passportNumber", "passport"]))
+            issue_date = _fmt_date(_get_person_value(p, ["passport_issuance_date", "passportIssuanceDate"]))
+            expiry_date = _fmt_date(_get_person_value(p, ["passport_expiry_date", "passportExpiryDate"]))
+            issue_country = _fmt_field(_get_person_value(p, passport_issue_aliases))
+            dob = _fmt_date(_get_person_value(p, ["date_of_birth", "dateOfBirth", "dob"]))
+            gender = _gender_text(p.get("gender") or "")
+            email = _fmt_field(_get_person_value(p, ["email"]))
+            re_email = _fmt_field(_get_person_value(p, ["re-email", "re_email", "reEmail"]) or _get_person_value(p, ["email"]))
+            phone = _fmt_field(_phone_number(p))
+            lines.append(f"同行{idx}：")
+            _append_if(lines, "中文名", zh)
+            _append_if(lines, "英文名", en)
+            _append_if(lines, "護照", passport)
+            _append_if(lines, "發照日期", issue_date)
+            _append_if(lines, "截止日期", expiry_date)
+            _append_if(lines, "發照地", issue_country)
+            _append_if(lines, "生日", dob)
+            _append_if(lines, "性別", gender)
+            if email != "（未提供）" or re_email != "（未提供）":
+                lines.append(f"  Email：{email} / {re_email}")
+            _append_if(lines, "電話", phone)
+            lines.append("")
         if len(passengers) > max_count:
             lines.append("...其餘略")
         return lines
@@ -1150,18 +1218,25 @@ def build_paylink_summary_text(
         if not emergency:
             lines.append("（未提供）")
             return lines
-        lines.append(f"- 中文名：{emergency_zh} / English：{emergency_en}")
+        em_zh = emergency_zh
+        if em_zh == "（未提供）":
+            _, emergencies = _load_private_people()
+            token = _full_name(emergency)
+            match = _match_alias(token, emergencies)
+            if isinstance(match, dict):
+                em_zh = _fmt_field(match.get("chinese_name"))
+        lines.append(f"- 中文名：{_fmt_field(em_zh)}")
+        _append_if(lines, "英文名", emergency_en)
         if include_details:
-            lines.append(f"  電話：{emergency_phone}")
-            if emergency_rel != "（未提供）":
-                lines.append(f"  關係：{emergency_rel}")
+            _append_if(lines, "電話", emergency_phone)
+            _append_if(lines, "關係", emergency_rel)
         return lines
 
-    def assemble(max_count: int, include_companion_details: bool, include_emergency_details: bool) -> str:
+    def assemble(max_count: int, include_emergency_details: bool) -> str:
         date_text = departure_date if not arrival_date else f"{departure_date} ～ {arrival_date}"
         lines = [
             "🧾【付款前二次確認】",
-            f"訂單：{_fmt_field(order_id)}（booking_id: {_fmt_field(booking_id_inner)}）",
+            f"訂單：{_fmt_field(order_id)}",
             f"日期：{_fmt_field(date_text)}",
             f"出發：{_fmt_field(port_name)}",
             f"航程：{_fmt_field(itinerary_name)}",
@@ -1174,31 +1249,36 @@ def build_paylink_summary_text(
             f"金額：TWD {_fmt_field(amount)}",
             "",
             "主要乘客：",
-            f"- 中文名：{main_zh} / English：{main_en}",
-            f"  護照：{main_passport}",
-            f"  電話：{main_phone}",
+            f"- 中文名：{main_zh}",
         ])
+        _append_if(lines, "英文名", main_en)
+        _append_if(lines, "護照", main_passport)
+        _append_if(lines, "發照日期", _fmt_date(_get_person_value(main, ["passport_issuance_date", "passportIssuanceDate"])))
+        _append_if(lines, "截止日期", _fmt_date(_get_person_value(main, ["passport_expiry_date", "passportExpiryDate"])))
+        _append_if(lines, "發照地", main_issue_country)
+        _append_if(lines, "生日", _fmt_date(_get_person_value(main, ["date_of_birth", "dateOfBirth", "dob"])))
+        _append_if(lines, "性別", _gender_text(main.get("gender") or ""))
+        main_email = _fmt_field(_get_person_value(main, ["email"]))
+        main_re_email = _fmt_field(_get_person_value(main, ["re-email", "re_email", "reEmail"]) or _get_person_value(main, ["email"]))
+        if main_email != "（未提供）" or main_re_email != "（未提供）":
+            lines.append(f"  Email：{main_email} / {main_re_email}")
+        _append_if(lines, "電話", main_phone)
         lines.append("")
-        lines.extend(passenger_lines(max_count, include_companion_details))
+        lines.extend(passenger_lines(max_count))
         lines.append("")
         lines.extend(emergency_lines(include_emergency_details))
         lines.append("")
-        lines.append(f"👉 前往付款：{pay_url}")
-        lines.append(f"（連結有效 {ttl_minutes} 分鐘）")
+        lines.append(f"👉 前往付款：{pay_url}（連結有效 {ttl_minutes} 分鐘）")
         return "\n".join(lines).strip()
 
     max_count = min(len(passengers), 6) if passengers_available else 0
-    include_companion_details = True
     include_emergency_details = True
     for _ in range(8):
-        text = assemble(max_count, include_companion_details, include_emergency_details)
+        text = assemble(max_count, include_emergency_details)
         if len(text) <= 2000:
             return text
         if max_count > 1:
             max_count -= 1
-            continue
-        if include_companion_details:
-            include_companion_details = False
             continue
         if include_emergency_details:
             include_emergency_details = False
@@ -1208,8 +1288,7 @@ def build_paylink_summary_text(
     return "\n".join([
         "🧾【付款前二次確認】",
         f"訂單：{booking_id}",
-        f"👉 前往付款：{pay_url}",
-        f"（連結有效 {ttl_minutes} 分鐘）",
+        f"👉 前往付款：{pay_url}（連結有效 {ttl_minutes} 分鐘）",
     ])
 
 
@@ -2198,8 +2277,6 @@ def process_cruise_text_command(
             if summary:
                 for chunk in _split_line_messages(summary):
                     messages.append(TextSendMessage(text=chunk))
-            if pay_url:
-                messages.append(TextSendMessage(text=f"👉 前往付款：{pay_url}"))
             if messages:
                 if reply_token:
                     cruise_line_bot_api.reply_message(reply_token, messages[:5])
@@ -2324,8 +2401,6 @@ def process_cruise_text_command(
         if summary:
             for chunk in _split_line_messages(summary):
                 messages.append(TextSendMessage(text=chunk))
-        if pay_url:
-            messages.append(TextSendMessage(text=f"👉 前往付款：{pay_url}"))
         if messages:
             if reply_token:
                 cruise_line_bot_api.reply_message(reply_token, messages[:5])
@@ -2686,35 +2761,9 @@ def _book_and_paylink_with_people(
         booking_summary=booking_summary if isinstance(booking_summary, dict) else None,
     )
 
-    payload_preview = json.dumps({
-        "customer_pax": pax,
-        "recordUpdatedTime": latest_record_updated_time,
-        "main_passenger": main_passenger,
-        "passenger_list": companions,
-        "emergency_contact": emergency,
-    }, ensure_ascii=False)
-
-    details_lines = [
-        summary_text,
-        f"\u4e58\u5ba2\u7e3d\u4eba\u6578\uff1a{pax}",
-        "",
-        "\u4e3b\u4e58\u5ba2\uff1a",
-        _format_passenger_details(main_passenger),
-    ]
-    for idx, p in enumerate(companions, 1):
-        details_lines.append("")
-        details_lines.append(f"\u540c\u884c{idx}\uff1a")
-        details_lines.append(_format_passenger_details(p))
-    details_lines.append("")
-    details_lines.append("\u7dca\u6025\u806f\u7d61\u4eba\uff1a")
-    details_lines.append(_format_emergency_details(emergency))
-    details_lines.append("")
-    details_lines.append("\u5373\u5c07\u9001\u51fa\u7684 booking payload\uff1a")
-    details_lines.append(payload_preview)
-
     return {
         "ok": True,
-        "summary_text": "\n".join(details_lines),
+        "summary_text": summary_text,
         "pay_url": pay_url,
         "expires_at": datetime.fromtimestamp(paylink_entry["expires_at"], timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }, 200
