@@ -6,13 +6,13 @@ monitors.json
 ngrok.exe
 ngrok
 *.exe
-.env
+.env*
 # --- SDC / Cruise local secrets & runtime state ---
 latest_tokens.json
 state/
 *.lock
 state/
 .vscode
-users_cruise.json
+users_cruise.*
 monitors_cruise.json
 __pycache__/

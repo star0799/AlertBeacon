@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 from filelock import FileLock
 
 load_dotenv()
+PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip()
 
 app = Flask(__name__)
 app.json.ensure_ascii = False
@@ -99,7 +100,7 @@ def cruise_tokens():
     })
     write_json(TOKENS_CACHE_FILE, _latest_tokens)
     print(f"[{ts()}] [CRUISE] tokens updated", _latest_tokens["at"])
-    should_notify = CRUISE_RELOGIN_NEEDED or (prev_access != data.get("accessToken"))
+    should_notify = CRUISE_RELOGIN_NEEDED or was_missing
     if should_notify:
         now = time.time()
         if now - LAST_RECOVER_ALERT_AT >= 60:
@@ -512,7 +513,14 @@ def cruise_paylink_create():
 
     code = result["code"]
     expires_at = result["expires_at"]
-    pay_url = f"{_get_base_url()}/cruise/pay/{code}"
+    resolved_base = get_public_base_url(request)
+    pay_url = f"{resolved_base}/cruise/pay/{code}"
+    _update_paylink_url(code, pay_url)
+    print(
+        f"[{ts()}] [CRUISE] paylink base_url PUBLIC_BASE_URL raw='{PUBLIC_BASE_URL}' "
+        f"resolved_base='{resolved_base}' pay_url='{pay_url}'",
+        flush=True,
+    )
 
     access_token = get_latest_access_token()
     booking_summary = fetch_booking_summary(access_token, booking_id) if access_token else None
@@ -564,8 +572,14 @@ def cruise_book_and_paylink():
         resp.headers["Content-Type"] = "application/json; charset=utf-8"
         return resp, 403
 
+    resolved_base = get_public_base_url(request)
+    print(
+        f"[{ts()}] [CRUISE] command base_url PUBLIC_BASE_URL raw='{PUBLIC_BASE_URL}' "
+        f"resolved_base='{resolved_base}'",
+        flush=True,
+    )
     trace_id = _make_trace_id()
-    payload, status = _book_and_paylink_flow(data, _get_base_url(), trace_id)
+    payload, status = _book_and_paylink_flow(data, resolved_base, trace_id)
     resp = jsonify(payload)
     resp.headers["Content-Type"] = "application/json; charset=utf-8"
     return resp, status
@@ -1297,12 +1311,23 @@ def _is_booking_cancelled(summary: dict) -> bool:
     return "cancel" in status
 
 
+def get_public_base_url(req=None) -> str:
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL.rstrip("/")
+    try:
+        if req is None:
+            req = request
+        proto = req.headers.get("X-Forwarded-Proto")
+        host = req.headers.get("X-Forwarded-Host")
+        if proto and host:
+            return f"{proto}://{host}"
+        return req.url_root.rstrip("/")
+    except Exception:
+        return "http://127.0.0.1:5000"
+
+
 def _get_base_url() -> str:
-    proto = request.headers.get("X-Forwarded-Proto")
-    host = request.headers.get("X-Forwarded-Host")
-    if proto and host:
-        return f"{proto}://{host}"
-    return request.host_url.rstrip("/")
+    return get_public_base_url(request)
 
 
 def create_paylink_entry(
@@ -1340,6 +1365,19 @@ def create_paylink_entry(
         write_json_atomic(PAY_LINKS_FILE, links)
 
     return {"code": code, "expires_at": expires_at}
+
+
+def _update_paylink_url(code: str, pay_url: str) -> None:
+    if not code or not pay_url:
+        return
+    lock = FileLock(PAY_LINKS_LOCK)
+    with lock:
+        links = read_json(PAY_LINKS_FILE, {})
+        entry = links.get(code) if isinstance(links, dict) else None
+        if isinstance(entry, dict):
+            entry["pay_url"] = pay_url
+            links[code] = entry
+            write_json_atomic(PAY_LINKS_FILE, links)
 
 
 def _log_backend_response(trace_id: str, label: str, resp: requests.Response):
@@ -1513,8 +1551,14 @@ def _book_and_paylink_flow(data: dict, base_url: str, trace_id: str) -> tuple[di
 
         code = paylink_entry["code"]
         expires_at_epoch = paylink_entry["expires_at"]
-        expires_at_iso = datetime.utcfromtimestamp(expires_at_epoch).strftime("%Y-%m-%dT%H:%M:%SZ")
+        expires_at_iso = datetime.fromtimestamp(expires_at_epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         pay_url = f"{base_url}/cruise/pay/{code}"
+        print(
+            f"[{ts()}] [CRUISE] paylink base_url PUBLIC_BASE_URL raw='{PUBLIC_BASE_URL}' "
+            f"resolved_base_from_arg='{base_url}' pay_url='{pay_url}'",
+            flush=True,
+        )
+        _update_paylink_url(code, pay_url)
         summary_text = build_paylink_summary_text(
             booking_id=numeric_id,
             pay_url=pay_url,
@@ -2114,6 +2158,7 @@ def process_cruise_text_command(
             result["actions"]["paylink"] = {"attempted": False, "paylink_record": {"ttl_seconds": payload.get("ttl_seconds")}}
             result["ok"] = True
             return result
+
         trace_id = _make_trace_id()
         flow_result, status = _book_and_paylink_flow(payload, _get_base_url(), trace_id)
         result["actions"]["booking"]["attempted"] = True
@@ -2134,6 +2179,18 @@ def process_cruise_text_command(
             "expires_at": flow_result.get("expires_at"),
             "summary_text": flow_result.get("summary_text"),
         })
+        resolved_base = get_public_base_url(request)
+        print(
+            f"[{ts()}] [CRUISE] process_cruise_text_command base_url "
+            f"PUBLIC_BASE_URL raw='{PUBLIC_BASE_URL}' resolved_base='{resolved_base}' "
+            f"pay_url='{flow_result.get('pay_url')}'",
+            flush=True,
+        )
+
+        print(
+            f"[{ts()}] [CRUISE] command paylink returned pay_url='{flow_result.get('pay_url')}'",
+            flush=True,
+        )
         if reply or reply_token:
             summary = flow_result.get("summary_text") or ""
             pay_url = flow_result.get("pay_url") or ""
@@ -2246,6 +2303,18 @@ def process_cruise_text_command(
         "expires_at": flow_result.get("expires_at"),
         "summary_text": flow_result.get("summary_text"),
     })
+    resolved_base = get_public_base_url(request)
+    print(
+        f"[{ts()}] [CRUISE] process_cruise_text_command base_url "
+        f"PUBLIC_BASE_URL raw='{PUBLIC_BASE_URL}' resolved_base='{resolved_base}' "
+        f"pay_url='{flow_result.get('pay_url')}'",
+        flush=True,
+    )
+
+    print(
+        f"[{ts()}] [CRUISE] command paylink returned pay_url='{flow_result.get('pay_url')}'",
+        flush=True,
+    )
     if CRUISE_RELOGIN_NEEDED:
         result["relogin_required"] = True
     if reply or reply_token:
@@ -2609,6 +2678,7 @@ def _book_and_paylink_with_people(
         return {"ok": False, "error": "\u7121\u6cd5\u5efa\u7acb\u4ed8\u6b3e\u9023\u7d50"}, 500
 
     pay_url = f"{_get_base_url()}/cruise/pay/{paylink_entry['code']}"
+    _update_paylink_url(paylink_entry["code"], pay_url)
     summary_text = build_paylink_summary_text(
         booking_id=numeric_id,
         pay_url=pay_url,
@@ -2646,7 +2716,7 @@ def _book_and_paylink_with_people(
         "ok": True,
         "summary_text": "\n".join(details_lines),
         "pay_url": pay_url,
-        "expires_at": datetime.utcfromtimestamp(paylink_entry["expires_at"]).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "expires_at": datetime.fromtimestamp(paylink_entry["expires_at"], timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }, 200
 
 def fetch_itinerary(access_token: str, date: str) -> str | None:
