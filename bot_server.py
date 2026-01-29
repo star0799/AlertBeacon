@@ -370,25 +370,7 @@ def cruise_pay(code: str):
                     if isinstance(cb, dict) and isinstance(cb.get("main_passenger"), dict):
                         main_passenger = cb.get("main_passenger")
 
-            phone_aliases = ["phone_number", "phoneNumber"]
-            if _is_missing(_get_nested_value(main_passenger or {}, phone_aliases)):
-                resp = jsonify({
-                    "ok": False,
-                    "error": "主乘客缺電話，請補齊後再試",
-                })
-                resp.headers["Content-Type"] = "application/json; charset=utf-8"
-                return resp, 400
-
-            if passenger_list:
-                if all(
-                    _is_missing(_get_nested_value(p, phone_aliases))
-                    for p in passenger_list
-                    if isinstance(p, dict)
-                ):
-                    print(
-                        f"[{ts()}] [CRUISE] precheck note: pax phone_number not present in booking passenger_list; only validate main_passenger",
-                        flush=True,
-                    )
+            # phone_number check removed per request
         # ----- end check -----
 
         # Mark used before calling payment API to prevent replay
@@ -1043,7 +1025,7 @@ def _full_name(person: dict) -> str:
     given = person.get("given_name") or person.get("first_name") or ""
     surname = person.get("surname") or person.get("last_name") or ""
     if given and surname:
-        return f"{given} [{surname}]"
+        return f"[{surname}] {given}"
     return " ".join([x for x in [given, surname] if x])
 
 
@@ -1225,6 +1207,23 @@ def build_paylink_summary_text(
             match = _match_alias(token, emergencies)
             if isinstance(match, dict):
                 em_zh = _fmt_field(match.get("chinese_name"))
+            if em_zh == "（未提供）":
+                def _norm_name(v: str) -> str:
+                    return (v or "").strip().upper()
+                g = _norm_name(emergency.get("first_name") or emergency.get("given_name"))
+                s = _norm_name(emergency.get("last_name") or emergency.get("surname"))
+                if g or s:
+                    for item in emergencies:
+                        if not isinstance(item, dict):
+                            continue
+                        contact = item.get("emergency_contact")
+                        if not isinstance(contact, dict):
+                            continue
+                        cg = _norm_name(contact.get("first_name") or contact.get("given_name"))
+                        cs = _norm_name(contact.get("last_name") or contact.get("surname"))
+                        if g == cg and s == cs:
+                            em_zh = _fmt_field(item.get("chinese_name"))
+                            break
         lines.append(f"- 中文名：{_fmt_field(em_zh)}")
         _append_if(lines, "英文名", emergency_en)
         if include_details:
