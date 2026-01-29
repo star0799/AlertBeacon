@@ -3201,14 +3201,30 @@ def handle_cruise_message(event):
         )
         if not result.get("ok"):
             reason = (result.get("errors") or [""])[0]
-            msg = (
-                "\u683c\u5f0f\u932f\u8aa4\uff0c\u8acb\u7528\uff1a\n"
-                "\u8a02\u623f <\u65e5\u671f> <\u623f\u578b> <\u4e3b\u4e58\u5ba2> [\u540c\u884c\u4e58\u5ba2...] <\u7dca\u6025\u806f\u7d61\u4eba> \u9001\u51fa\n"
-                "\u65e5\u671f\u652f\u63f4\uff1a2026-02-22 / 2026/2/22 / 2026.02.22 / 20260222\n"
-                "\u623f\u578b\uff1a\u5167\u5074 / \u6d77\u666f / \u9732\u53f0 / \u967d\u53f0\uff08\u9732\u53f0=\u967d\u53f0\uff09"
+            short_error = reason or "處理失敗，請稍後再試"
+            usage_help = (
+                "格式錯誤，請用：\n"
+                "訂房 <日期> <房型> <主乘客> [同行乘客...] <緊急聯絡人> \n"
+                "日期支援：2026-02-22 / 2026/2/22 / 2026.02.22 / 20260222\n"
+                "房型：內側 / 海景 / 露台 / 陽台（露台=陽台）\n"
+                "完整格式如：訂房 2026/02/22 海景房 周惠X 李X樂 李X貴 李X昇\n"
             )
-            if reason:
-                msg = f"{reason}\n\n" + msg
+            msg = short_error
+            if result.get("error_type") == "parse_error":
+                reason_lower = (reason or "").lower()
+                business_keywords = [
+                    "會員驗證失敗",
+                    "驗證失敗",
+                    "unauthorized",
+                    "未授權",
+                    "沒有",
+                    "booking",
+                    "payment",
+                    "訂單",
+                    "後端",
+                ]
+                if not any(k.lower() in reason_lower for k in business_keywords):
+                    msg = usage_help if not reason else f"{reason}\n\n" + usage_help
             cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
         return
 
