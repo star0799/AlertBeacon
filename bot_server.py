@@ -195,11 +195,8 @@ def cruise_pay(code: str):
             return resp, 410
 
         expires_at = int(entry.get("expires_at") or 0)
-        used_at = int(entry.get("used_at") or 0)
         if expires_at and now > expires_at:
             return jsonify({"ok": False, "error": "expired"}), 410
-        if used_at != 0:
-            return jsonify({"ok": False, "error": "used"}), 410
 
         booking_id = entry.get("booking_id")
         record_updated_time = entry.get("recordUpdatedTime")
@@ -373,10 +370,7 @@ def cruise_pay(code: str):
             # phone_number check removed per request
         # ----- end check -----
 
-        # Mark used before calling payment API to prevent replay
-        entry["used_at"] = now
-        links[code] = entry
-        write_json_atomic(PAY_LINKS_FILE, links)
+        # used_at removed: allow unlimited access within TTL
 
     def _norm_payment_for(s: str) -> str:
         return (s or "").strip().lower().replace("_", " ")
@@ -431,35 +425,12 @@ def cruise_pay(code: str):
         )
         if status in (401, 403):
             trigger_relogin("payment", f"status={status}")
-        # rollback used_at
-        lock = FileLock(PAY_LINKS_LOCK)
-        with lock:
-            links = read_json(PAY_LINKS_FILE, {})
-            entry2 = links.get(code)
-            if isinstance(entry2, dict) and entry2.get("used_at") == now:
-                entry2["used_at"] = 0
-                links[code] = entry2
-                write_json_atomic(PAY_LINKS_FILE, links)
         return jsonify({"ok": False, "error": f"payment api failed ({status})", "detail": detail}), 502
     except Exception as ex:
         # timeout / json decode / ValueError
-        lock = FileLock(PAY_LINKS_LOCK)
-        with lock:
-            links = read_json(PAY_LINKS_FILE, {})
-            entry2 = links.get(code)
-            if isinstance(entry2, dict) and entry2.get("used_at") == now:
-                entry2["used_at"] = 0
-                links[code] = entry2
-                write_json_atomic(PAY_LINKS_FILE, links)
         return jsonify({"ok": False, "error": f"payment api failed", "detail": str(ex)}), 502
 
-    # Option B: delete entry after successful redirect to keep file clean.
-    lock = FileLock(PAY_LINKS_LOCK)
-    with lock:
-        links = read_json(PAY_LINKS_FILE, {})
-        if isinstance(links, dict) and code in links:
-            del links[code]
-            write_json_atomic(PAY_LINKS_FILE, links)
+    # keep entry until expiry for repeated access
 
     html_page = _build_auto_post_form(endpoint, config)
     return html_page, 200, {"Content-Type": "text/html; charset=utf-8"}
@@ -488,7 +459,7 @@ def cruise_paylink_create():
         if not item.get("payment_for") or not item.get("payment_method"):
             return jsonify({"ok": False, "error": "missing payment_for/payment_method"}), 400
 
-    ttl_seconds = _normalize_ttl_seconds(data.get("ttl_seconds", 600))
+    ttl_seconds = _normalize_ttl_seconds(data.get("ttl_seconds", 300))
     result = create_paylink_entry(booking_id, record_updated_time, payment_method, ttl_seconds)
     if not result:
         return jsonify({"ok": False, "error": "failed to generate code"}), 500
@@ -1295,11 +1266,11 @@ def _normalize_ttl_seconds(value) -> int:
     try:
         ttl_seconds = int(value)
     except Exception:
-        ttl_seconds = 600
+        ttl_seconds = 300
     if ttl_seconds < 60:
         ttl_seconds = 60
-    if ttl_seconds > 3600:
-        ttl_seconds = 3600
+    if ttl_seconds > 300:
+        ttl_seconds = 300
     return ttl_seconds
 
 
@@ -1522,7 +1493,7 @@ def _book_and_paylink_flow(data: dict, base_url: str, trace_id: str) -> tuple[di
     if not payment_method:
         return {"ok": False, "error": "invalid payment_method"}, 400
 
-    ttl_seconds = _normalize_ttl_seconds(data.get("ttl_seconds", 600))
+    ttl_seconds = _normalize_ttl_seconds(data.get("ttl_seconds", 300))
     headers = _cruise_payment_headers(access_token)
 
     print(f"[{ts()}] [CRUISE] trace={trace_id} draft record_updated_time={record_updated_time}", flush=True)
@@ -2335,7 +2306,7 @@ def process_cruise_text_command(
             "emergency_contact": emergency,
         }
         result["actions"]["booking"] = {"attempted": False, "booking_request": booking_request}
-        result["actions"]["paylink"] = {"attempted": False, "paylink_record": {"ttl_seconds": 1800}}
+        result["actions"]["paylink"] = {"attempted": False, "paylink_record": {"ttl_seconds": 300}}
         result["ok"] = not result["errors"]
         if result["errors"]:
             result["error_type"] = "parse_error"
@@ -2358,7 +2329,7 @@ def process_cruise_text_command(
         date=date_text,
         tier=tier,
         names=names,
-        ttl_seconds=1800,
+        ttl_seconds=300,
         trace_id=trace_id,
     )
     result["actions"]["booking"]["attempted"] = True
