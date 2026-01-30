@@ -3310,6 +3310,20 @@ def handle_cruise_message(event):
         cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
 
+    if raw_text in ("緊急聯絡人", "聯絡人"):
+        _, emergencies = _load_private_people()
+        names = []
+        if isinstance(emergencies, list):
+            for item in emergencies:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("chinese_name")
+                if isinstance(name, str) and name.strip():
+                    names.append(name.strip())
+        reply = " ".join(names) if names else "找不到緊急聯絡人資料"
+        cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
+
     if raw_text.startswith(("\u8a02\u623f", "\u8ba2\u623f")):
         if not is_cruise_daemon_enabled():
             reply = "\u8a02\u623f\u529f\u80fd\u76ee\u524d\u672a\u555f\u7528"
