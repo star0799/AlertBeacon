@@ -1031,14 +1031,53 @@ def _cruise_headers(access_token: str) -> dict:
 
 
 def fetch_booking_summary(access_token: str, booking_id_numeric: int) -> dict | None:
+    customers_url = f"{CRUISE_BACKEND_BASE}/customers/booking/{booking_id_numeric}"
+    try:
+        r = requests.get(customers_url, headers=_cruise_headers(access_token), timeout=20)
+        if r.status_code == 200:
+            try:
+                payload = r.json() or {}
+            except Exception:
+                payload = None
+            print(
+                f"[{ts()}] [CRUISE] booking summary source=customers/booking booking_id={booking_id_numeric}",
+                flush=True,
+            )
+            return payload if isinstance(payload, dict) else None
+        body_head = ""
+        try:
+            body_head = (r.text or "")[:300]
+        except Exception:
+            body_head = ""
+        print(
+            f"[{ts()}] [CRUISE] customers/booking fetch failed status={r.status_code} body_head={body_head}",
+            flush=True,
+        )
+    except Exception as ex:
+        body_head = str(ex)[:200]
+        print(
+            f"[{ts()}] [CRUISE] customers/booking fetch failed status=None body_head={body_head}",
+            flush=True,
+        )
+
     url = f"{CRUISE_BACKEND_BASE}/booking/{booking_id_numeric}"
     try:
-        r = requests.get(url, headers=_cruise_payment_headers(access_token), timeout=10)
+        r = requests.get(url, headers=_cruise_headers(access_token), timeout=20)
         r.raise_for_status()
         payload = r.json() or {}
         if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+            print(
+                f"[{ts()}] [CRUISE] booking summary source=booking booking_id={booking_id_numeric}",
+                flush=True,
+            )
             return payload.get("data")
-        return payload if isinstance(payload, dict) else None
+        if isinstance(payload, dict):
+            print(
+                f"[{ts()}] [CRUISE] booking summary source=booking booking_id={booking_id_numeric}",
+                flush=True,
+            )
+            return payload
+        return None
     except Exception:
         return None
 
