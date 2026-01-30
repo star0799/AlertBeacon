@@ -3312,8 +3312,8 @@ def handle_cruise_message(event):
                     "訂單",
                     "後端",
                 ]
-                if not any(k.lower() in reason_lower for k in business_keywords):
-                    msg = usage_help if not reason else f"{reason}\n\n" + usage_help
+                if not any(k.lower() in reason_lower for k in business_keywords) and not reason:
+                    msg = usage_help
             cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
         return
 
