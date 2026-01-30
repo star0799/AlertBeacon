@@ -2477,11 +2477,9 @@ def _resolve_passengers_and_emergency(
     if not latest_record_updated_time:
         return None, None, None, "無法取得 recordUpdatedTime，請重試"
 
-    def current_user_mmid() -> str | None:
-        mmid = _latest_tokens.get("user_mmid")
-        if _looks_like_mmid(mmid):
-            return str(mmid)
-        return None
+    login_customer_id = (_latest_tokens or {}).get("customer_id") or (_latest_tokens or {}).get("user_mmid")
+    if not login_customer_id:
+        return None, None, None, "尚未登入/未同步 token"
 
     fc_list = None
 
@@ -2510,68 +2508,78 @@ def _resolve_passengers_and_emergency(
 
     def build_passenger(token: str, label: str, is_main: bool) -> tuple[dict | None, str | None]:
         entry = _match_alias(token, people)
+        if not entry:
+            return None, f"找不到{label}資料，請在 private_people.json 補 alias"
         is_member = bool(entry and entry.get("is_member"))
-        if is_member:
-            mmid = entry.get("mmid")
-            if not isinstance(mmid, str) or not mmid.strip():
-                return None, "會員乘客缺少 mmid，請在 private_people.json 補齊"
-            if is_main:
-                current = current_user_mmid()
-
-            passenger = entry.get("passenger") if isinstance(entry.get("passenger"), dict) else {}
-            overrides = entry.get("passenger_overrides") if isinstance(entry.get("passenger_overrides"), dict) else {}
-            base = _merge_dict(passenger, overrides)
-            ok, result = _validate_mmid(
-                access_token,
-                numeric_id,
-                latest_record_updated_time,
-                mmid_list=[mmid],
-                fc_ids=[],
-            )
-            if not ok:
-                return None, f"會員驗證失敗：{mmid} {result}"
-            base = merge_validate_fields(base, result if isinstance(result, dict) else {})
-            if is_main:
-                set_current_user_mmid(mmid)
+        if is_main:
+            mmid = entry.get("mmid") if isinstance(entry, dict) else None
+            if is_member and isinstance(mmid, str) and mmid.strip():
+                if str(mmid).strip() == str(login_customer_id).strip():
+                    passenger = entry.get("passenger") if isinstance(entry.get("passenger"), dict) else {}
+                    overrides = entry.get("passenger_overrides") if isinstance(entry.get("passenger_overrides"), dict) else {}
+                    base = _merge_dict(passenger, overrides)
+                else:
+                    return None, (
+                        f"主乘客帳號不符：目前登入 customer_id={login_customer_id}，主乘客 mmid={mmid}。"
+                        "請切換登入主乘客帳號後再試。"
+                    )
+            else:
+                return None, "主乘客必須在 private_people.json 設定 is_member=true 並填 mmid（用於登入者比對）"
         else:
-            if is_main:
-                return None, "主乘客必須為會員，請在 private_people.json 設定 is_member=true"
-            try:
-                fc_list_local = get_fc_list()
-            except PermissionError:
-                return None, "Token 已過期，請重新登入 SDC 後再試"
+            if is_member:
+                mmid = entry.get("mmid")
+                if not isinstance(mmid, str) or not mmid.strip():
+                    return None, "會員乘客缺少 mmid，請在 private_people.json 補齊"
 
-            overrides = {}
-            hints = {}
-            if entry:
-                if isinstance(entry.get("passenger"), dict):
-                    hints = dict(entry.get("passenger"))
-                if isinstance(entry.get("passenger_overrides"), dict):
-                    overrides = dict(entry.get("passenger_overrides"))
-                    hints = _merge_dict(hints, overrides)
+                passenger = entry.get("passenger") if isinstance(entry.get("passenger"), dict) else {}
+                overrides = entry.get("passenger_overrides") if isinstance(entry.get("passenger_overrides"), dict) else {}
+                base = _merge_dict(passenger, overrides)
+                ok, result = _validate_mmid(
+                    access_token,
+                    numeric_id,
+                    latest_record_updated_time,
+                    mmid_list=[mmid],
+                    fc_ids=[],
+                )
+                if not ok:
+                    return None, f"會員驗證失敗：mmid={mmid} {result}"
+                base = merge_validate_fields(base, result if isinstance(result, dict) else {})
+            else:
+                try:
+                    fc_list_local = get_fc_list()
+                except PermissionError:
+                    return None, "Token 已過期，請重新登入 SDC 後再試"
 
-            fc_person, err = _find_fc_matches(fc_list_local, token, hints)
-            if err:
-                return None, err
-            fc_id = fc_person.get("id")
-            if not fc_id:
-                return None, "找不到該乘客的親友資料，請先加入常用旅客或補 private_people.json"
+                overrides = {}
+                hints = {}
+                if entry:
+                    if isinstance(entry.get("passenger"), dict):
+                        hints = dict(entry.get("passenger"))
+                    if isinstance(entry.get("passenger_overrides"), dict):
+                        overrides = dict(entry.get("passenger_overrides"))
+                        hints = _merge_dict(hints, overrides)
 
-            base = _map_fc_to_passenger(fc_person)
-            if overrides:
-                base = _merge_dict(base, overrides)
+                fc_person, err = _find_fc_matches(fc_list_local, token, hints)
+                if err:
+                    return None, err
+                fc_id = fc_person.get("id")
+                if not fc_id:
+                    return None, "找不到該乘客的親友資料，請先加入常用旅客或補 private_people.json"
 
-            ok, result = _validate_mmid(
-                access_token,
-                numeric_id,
-                latest_record_updated_time,
-                mmid_list=[],
-                fc_ids=[int(fc_id)],
-            )
-            if not ok:
-                return None, f"常用旅客驗證失敗：{result}"
-            base = merge_validate_fields(base, result if isinstance(result, dict) else {})
+                base = _map_fc_to_passenger(fc_person)
+                if overrides:
+                    base = _merge_dict(base, overrides)
 
+                ok, result = _validate_mmid(
+                    access_token,
+                    numeric_id,
+                    latest_record_updated_time,
+                    mmid_list=[],
+                    fc_ids=[int(fc_id)],
+                )
+                if not ok:
+                    return None, f"常用旅客驗證失敗：{result}"
+                base = merge_validate_fields(base, result if isinstance(result, dict) else {})
         base["gender"] = _normalize_gender(base.get("gender"))
         if base.get("phone_number"):
             base["phone_number"] = _normalize_phone_digits(base.get("phone_number"))
