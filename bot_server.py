@@ -1098,11 +1098,10 @@ def _chinese_name(person: dict) -> str:
 def _phone_number(person: dict) -> str:
     if not isinstance(person, dict):
         return ""
-    country = person.get("phone_country_code_number") or person.get("country_code") or ""
     number = person.get("phone_number") or person.get("phone") or person.get("mobile") or ""
-    if country and number:
-        return f"{country}{number}"
-    return number or country or ""
+    if  number:
+        return f"{number}"
+    return number or ""
 
 
 def _extract_passengers(booking_summary: dict) -> list[dict]:
@@ -1832,7 +1831,7 @@ def _find_fc_matches(
     hints: dict | None,
 ) -> tuple[dict | None, str | None]:
     if not isinstance(fc_list, list):
-        return None, "找不到該乘客的親友資料，請先加入常用旅客或補 private_people.json"
+        return None, "無法取得常用旅客清單，請先加入常用旅客或補 private_people.json"
     hints = hints or {}
     token_norm = _normalize_name_value(token)
 
@@ -1861,7 +1860,7 @@ def _find_fc_matches(
     matches = match_by("chinese_name", chinese)
     if matches:
         if len(matches) > 1:
-            return None, "乘客資料不只一筆，請提供更完整資料以辨識"
+            return None, "常用旅客比對到多筆結果，請補充更多資訊（護照號碼或生日）"
         return matches[0], None
 
     if given and surname:
@@ -1872,24 +1871,22 @@ def _find_fc_matches(
         ]
         if matches:
             if len(matches) > 1:
-                return None, "乘客資料不只一筆，請提供更完整資料以辨識"
+                return None, "常用旅客比對到多筆結果，請補充更多資訊（護照號碼或生日）"
             return matches[0], None
 
     matches = match_by("passport_number", passport)
     if matches:
         if len(matches) > 1:
-            return None, "乘客資料不只一筆，請提供更完整資料以辨識"
+            return None, "常用旅客比對到多筆結果，請補充更多資訊（護照號碼或生日）"
         return matches[0], None
 
     matches = match_by("date_of_birth", dob)
     if matches:
         if len(matches) > 1:
-            return None, "乘客資料不只一筆，請提供更完整資料以辨識"
+            return None, "常用旅客比對到多筆結果，請補充更多資訊（護照號碼或生日）"
         return matches[0], None
 
-    return None, "找不到該乘客的親友資料，請先加入常用旅客或補 private_people.json"
-
-
+    return None, f"找不到{token}的親友資料，請先加入常用旅客或補 private_people.json"
 def _merge_dict(base: dict, override: dict) -> dict:
     merged = dict(base or {})
     for k, v in (override or {}).items():
@@ -2564,7 +2561,7 @@ def _resolve_passengers_and_emergency(
                     return None, err
                 fc_id = fc_person.get("id")
                 if not fc_id:
-                    return None, "找不到該乘客的親友資料，請先加入常用旅客或補 private_people.json"
+                    return None, f"找不到{token}的親友資料，請先加入常用旅客或補 private_people.json"
 
                 base = _map_fc_to_passenger(fc_person)
                 if overrides:
