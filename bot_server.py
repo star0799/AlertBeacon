@@ -398,42 +398,71 @@ def cruise_pay(code: str):
 
     url = f"{CRUISE_BACKEND_BASE}/customers/v2/booking/payment/{booking_id}"
 
-    try:
-        r = requests.post(url, headers=_cruise_payment_headers(access_token), json=body, timeout=20)
-        r.raise_for_status()
-        data = r.json() or {}
-        cs = (data.get("cybersource_response") or {})
-        endpoint = cs.get("endPoint")
-        config = cs.get("config") or {}
-        if not endpoint or not isinstance(config, dict) or not config:
-            raise ValueError("missing cybersource response")
-    except requests.HTTPError as ex:
-        resp = ex.response
-        status = resp.status_code if resp is not None else None
-        body_head = ""
-        detail = None
-        if resp is not None:
-            try:
-                detail = resp.json()
-                body_head = json.dumps(detail, ensure_ascii=False)[:1200]
-            except Exception:
-                body_head = (resp.text or "")[:1200]
-                detail = body_head
-        print(
-            f"[{ts()}] [CRUISE] payment failed: attempt=1 status={status} body_head={body_head}",
-            flush=True,
-        )
-        if status in (401, 403):
-            trigger_relogin("payment", f"status={status}")
-        return jsonify({"ok": False, "error": f"payment api failed ({status})", "detail": detail}), 502
-    except Exception as ex:
-        # timeout / json decode / ValueError
-        return jsonify({"ok": False, "error": f"payment api failed", "detail": str(ex)}), 502
+    last_status = None
+    last_detail = None
+    last_error = None
 
-    # keep entry until expiry for repeated access
+    for attempt in (1, 2):
+        access_token = _latest_tokens.get("accessToken")
+        if not access_token:
+            return jsonify({"ok": False, "error": "missing access token"}), 401
+        try:
+            r = requests.post(url, headers=_cruise_payment_headers(access_token), json=body, timeout=20)
+            status = r.status_code
+            print(
+                f"[{ts()}] [CRUISE] payment attempt={attempt} status={status}",
+                flush=True,
+            )
+            r.raise_for_status()
+            data = r.json() or {}
+            cs = (data.get("cybersource_response") or {})
+            endpoint = cs.get("endPoint")
+            config = cs.get("config") or {}
+            if not endpoint or not isinstance(config, dict) or not config:
+                raise ValueError("missing cybersource response")
 
-    html_page = _build_auto_post_form(endpoint, config)
-    return html_page, 200, {"Content-Type": "text/html; charset=utf-8"}
+            # keep entry until expiry for repeated access
+            html_page = _build_auto_post_form(endpoint, config)
+            return html_page, 200, {"Content-Type": "text/html; charset=utf-8"}
+        except requests.HTTPError as ex:
+            resp = ex.response
+            status = resp.status_code if resp is not None else None
+            body_head = ""
+            detail = None
+            last_error = ex
+            if resp is not None:
+                try:
+                    detail = resp.json()
+                    body_head = json.dumps(detail, ensure_ascii=False)[:1200]
+                except Exception:
+                    body_head = (resp.text or "")[:1200]
+                    detail = body_head
+            last_status = status
+            last_detail = detail
+            if status in (401, 403) and attempt == 1:
+                ok, err = refresh_access_token("payment")
+                if not ok:
+                    print(
+                        f"[{ts()}] [CRUISE] payment refresh failed err={err}",
+                        flush=True,
+                    )
+                if ok:
+                    continue
+            print(
+                f"[{ts()}] [CRUISE] payment failed: attempt={attempt} status={status} body_head={body_head}",
+                flush=True,
+            )
+            break
+        except Exception as ex:
+            # timeout / json decode / ValueError
+            last_error = ex
+            break
+
+    if last_status in (401, 403):
+        trigger_relogin("payment", f"status={last_status}")
+    if last_status is not None:
+        return jsonify({"ok": False, "error": f"payment api failed ({last_status})", "detail": last_detail}), 502
+    return jsonify({"ok": False, "error": f"payment api failed", "detail": str(last_error)}), 502
 
 
 @app.post("/cruise/paylink/create")
@@ -747,6 +776,10 @@ def write_json_atomic(path: str, data):
         print(f"[{ts()}] \u26a0\ufe0f \u5beb\u5165 {path} \u5931\u6557:{type(e).__name__}: {e}")
 
 
+def _save_latest_tokens() -> None:
+    write_json_atomic(TOKENS_CACHE_FILE, _latest_tokens)
+
+
 def load_features() -> dict:
     defaults = {
         "bot_server": True,
@@ -873,6 +906,57 @@ def get_latest_access_token():
     if isinstance(cached, dict):
         return cached.get("accessToken") or cached.get("access_token")
     return None
+
+
+def refresh_access_token(reason: str) -> tuple[bool, str]:
+    refresh_token = _latest_tokens.get("refreshToken")
+    if not refresh_token:
+        return False, "missing refreshToken"
+
+    url = f"{CRUISE_BACKEND_BASE}/auth/customer/refresh"
+    payload = {"refreshToken": refresh_token}
+    headers = {"Content-Type": "application/json"}
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=20)
+    except Exception as ex:
+        body_head = str(ex)[:200]
+        print(
+            f"[{ts()}] [CRUISE] token refresh failed status=None body_head={body_head}",
+            flush=True,
+        )
+        return False, "refresh failed None"
+
+    status = r.status_code
+    if status == 200:
+        data = {}
+        try:
+            data = r.json() or {}
+        except Exception:
+            data = {}
+        access_token = data.get("accessToken")
+        new_refresh = data.get("refreshToken")
+        if access_token and new_refresh:
+            _latest_tokens["accessToken"] = access_token
+            _latest_tokens["refreshToken"] = new_refresh
+            _latest_tokens["at"] = time.time()
+            _save_latest_tokens()
+            print(
+                f"[{ts()}] [CRUISE] token refreshed ok reason={reason} at={_latest_tokens['at']}",
+                flush=True,
+            )
+            return True, ""
+
+    body_head = ""
+    try:
+        detail = r.json()
+        body_head = json.dumps(detail, ensure_ascii=False)[:200]
+    except Exception:
+        body_head = (r.text or "")[:200]
+    print(
+        f"[{ts()}] [CRUISE] token refresh failed status={status} body_head={body_head}",
+        flush=True,
+    )
+    return False, f"refresh failed {status}"
 
 
 def _cruise_payment_headers(access_token: str) -> dict:
