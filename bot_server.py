@@ -3324,6 +3324,116 @@ def handle_cruise_message(event):
         cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
 
+    if raw_text in ("親友名單", "親友", "名單"):
+        access = get_latest_access_token()
+        if not access:
+            reply = "請先手動登入一次讓 Token Sync 回灌"
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
+        url = f"{CRUISE_BACKEND_BASE}/frequent-cruisers-customer"
+        try:
+            r = requests.get(url, headers=_cruise_payment_headers(access), timeout=20)
+        except Exception as ex:
+            reply = f"查詢親友名單失敗：{type(ex).__name__}"
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
+        if r.status_code in (401, 403):
+            reply = "Token 已過期，請重新登入 SDC 後再試"
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
+        if r.status_code >= 400:
+            reply = f"查詢親友名單失敗 (status={r.status_code})"
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
+        try:
+            payload = r.json() or {}
+        except Exception:
+            payload = {}
+
+        def _fmt_date(v):
+            if not v:
+                return ""
+            s = str(v).strip()
+            return s.split("T")[0] if "T" in s else s
+
+        def _gender_text(v: str) -> str:
+            g = (v or "").strip().lower()
+            if g in ("female", "f", "女"):
+                return "女"
+            if g in ("male", "m", "男"):
+                return "男"
+            return v or ""
+
+        def _append(lines_out: list[str], label: str, value) -> None:
+            if value is None:
+                return
+            if isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    return
+            else:
+                text = str(value)
+            lines_out.append(f"{label}：{text}")
+
+        def _render_person(person: dict) -> list[str]:
+            lines_out = []
+            if not isinstance(person, dict):
+                return lines_out
+            zh = person.get("chinese_name")
+            given = person.get("given_name") or ""
+            surname = person.get("surname") or ""
+            en = f"[{surname}] {given}".strip() if (surname or given) else ""
+            _append(lines_out, "中文名", zh)
+            _append(lines_out, "英文名", en)
+            _append(lines_out, "護照", person.get("passport_number"))
+            _append(lines_out, "發照日期", _fmt_date(person.get("passport_issuance_date")))
+            _append(lines_out, "截止日期", _fmt_date(person.get("passport_expiry_date")))
+            _append(lines_out, "發照地", person.get("passport_issuance_country"))
+            _append(lines_out, "生日", _fmt_date(person.get("date_of_birth")))
+            _append(lines_out, "性別", _gender_text(person.get("gender")))
+            return lines_out
+
+        lines_out = []
+        main_person = None
+        fc_list = []
+        if isinstance(payload, dict):
+            main_person = (
+                payload.get("customer")
+                or payload.get("customer_info")
+                or payload.get("customer_profile")
+                or payload.get("main_passenger")
+            )
+            data_list = payload.get("data")
+            if isinstance(data_list, list):
+                fc_list = [p for p in data_list if isinstance(p, dict)]
+        elif isinstance(payload, list):
+            fc_list = [p for p in payload if isinstance(p, dict)]
+
+        if main_person:
+            lines_out.append("主乘客")
+            lines_out.extend(_render_person(main_person))
+
+        for idx, person in enumerate(fc_list, 1):
+            lines_out.append(f"親友{idx}")
+            lines_out.extend(_render_person(person))
+
+        if not lines_out:
+            reply = "親友名單沒有資料"
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
+
+        text = "\n".join(lines_out)
+        chunks = _split_line_messages(text)
+        messages = [TextSendMessage(text=c) for c in chunks]
+        if event.reply_token:
+            cruise_line_bot_api.reply_message(event.reply_token, messages[:5])
+            remaining = messages[5:]
+        else:
+            remaining = messages
+        if remaining:
+            for i in range(0, len(remaining), 5):
+                cruise_line_bot_api.push_message(user_id, remaining[i:i+5])
+        return
     if raw_text.startswith(("\u8a02\u623f", "\u8ba2\u623f")):
         if not is_cruise_daemon_enabled():
             reply = "\u8a02\u623f\u529f\u80fd\u76ee\u524d\u672a\u555f\u7528"
