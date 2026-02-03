@@ -98,7 +98,7 @@ def cruise_tokens():
         "user_mmid": user_mmid,
         "at": data.get("at"),
     })
-    write_json(TOKENS_CACHE_FILE, _latest_tokens)
+    write_json_atomic(TOKENS_CACHE_FILE, _latest_tokens)
     print(f"[{ts()}] [CRUISE] tokens updated", _latest_tokens["at"])
     should_notify = CRUISE_RELOGIN_NEEDED or was_missing
     if should_notify:
@@ -645,20 +645,20 @@ def cruise_notify():
 
     elif t == "CRUISE_TIER_AVAILABLE":
         tier = data.get("tier")
-        tier_short = data.get("tier_short") or (str(tier) if tier is not None else "\u623f\u578b")
-        tier_full = data.get("tier_full") or (f"{tier}\u5ba2\u623f" if tier is not None else "\u623f\u578b")
+        tier_short = data.get("tier_short") or (str(tier) if tier is not None else "房型")
+        tier_full = data.get("tier_full") or (f"{tier}客房" if tier is not None else "房型")
         date = data.get("date") or ""
         port_name = data.get("port_name") or ""
         itinerary_name = data.get("itinerary_name") or ""
         max_pax = data.get("max_pax")
-        max_pax_text = f"\uff08{max_pax}\u4eba\uff09" if isinstance(max_pax, int) and max_pax > 0 else ""
+        max_pax_text = f"（{max_pax}人）" if isinstance(max_pax, int) and max_pax > 0 else ""
 
         text = (
-            f"\U0001F6A2\u3010\u67e5\u5230\u53ef\u8a02\u623f\u3011{tier_short}{max_pax_text}\n"
-            f"\u65e5\u671f\uff1a{date}\n"
-            f"\u51fa\u767c\uff1a{port_name}\n"
-            f"\u822a\u7a0b\uff1a{itinerary_name}\n"
-            f"\u623f\u578b\uff1a{tier_full}"
+            f"\U0001F6A2【查到可訂房】{tier_short}{max_pax_text}\n"
+            f"日期：{date}\n"
+            f"出發：{port_name}\n"
+            f"航程：{itinerary_name}\n"
+            f"房型：{tier_full}"
         )
 
     elif t == "CRUISE_NEED_RELOGIN":
@@ -737,7 +737,7 @@ def cruise_tokens_clear():
         "user_mmid": None,
         "at": None,
     })
-    write_json(TOKENS_CACHE_FILE, _latest_tokens)  # 若你做了持久化
+    write_json_atomic(TOKENS_CACHE_FILE, _latest_tokens)  # 若你做了持久化
     return jsonify({"ok": True})
 # ------------------------------------------------------
 # 基本 JSON 工具（不加鎖的版本）
@@ -773,7 +773,7 @@ def write_json_atomic(path: str, data):
             json.dump(data, f, indent=2, ensure_ascii=False)
         os.replace(tmp_path, path)
     except Exception as e:
-        print(f"[{ts()}] \u26a0\ufe0f \u5beb\u5165 {path} \u5931\u6557:{type(e).__name__}: {e}")
+        print(f"[{ts()}] ⚠️ 寫入 {path} 失敗:{type(e).__name__}: {e}")
 
 
 def _save_latest_tokens() -> None:
@@ -837,31 +837,36 @@ def trigger_relogin(reason: str, detail: str = "") -> None:
         "user_mmid": None,
         "at": None,
     })
-    write_json(TOKENS_CACHE_FILE, _latest_tokens)
+    write_json_atomic(TOKENS_CACHE_FILE, _latest_tokens)
     CRUISE_RELOGIN_NEEDED = True
 
 
-def is_cruise_daemon_enabled() -> bool:
+def _is_feature_enabled_live(name: str, log_ctx: str = "") -> bool:
+    """Reads features.json from disk to get the live value of a feature flag."""
     if not os.path.exists(FEATURES_FILE):
-        print(f"[{ts()}] [CRUISE] features missing: {FEATURES_FILE}", flush=True)
+        print(f"[{ts()}] [{log_ctx}] features missing: {FEATURES_FILE}", flush=True)
         return False
     try:
         lock = FileLock(FEATURES_FILE + ".lock")
         with lock:
             data = read_json(FEATURES_FILE, None)
     except Exception as e:
-        print(f"[{ts()}] [CRUISE] features read error: {e}", flush=True)
+        print(f"[{ts()}] [{log_ctx}] features read error: {e}", flush=True)
         return False
     if not isinstance(data, dict):
-        print(f"[{ts()}] [CRUISE] features parse error", flush=True)
+        print(f"[{ts()}] [{log_ctx}] features parse error", flush=True)
         return False
-    if "cruise_daemon" not in data:
-        print(f"[{ts()}] [CRUISE] features missing key: cruise_daemon", flush=True)
+    if name not in data:
+        print(f"[{ts()}] [{log_ctx}] features missing key: {name}", flush=True)
         return False
-    if not bool(data.get("cruise_daemon")):
-        print(f"[{ts()}] [CRUISE] features cruise_daemon disabled", flush=True)
-        return False
-    return True
+    enabled = bool(data.get(name))
+    if not enabled:
+        print(f"[{ts()}] [{log_ctx}] features {name} disabled", flush=True)
+    return enabled
+
+
+def is_cruise_daemon_enabled() -> bool:
+    return _is_feature_enabled_live("cruise_daemon", "CRUISE")
 
 
 def is_cruise_admin(user_id: str) -> bool:
@@ -890,7 +895,7 @@ def set_feature(name: str, enabled: bool) -> bool:
             if not isinstance(data, dict):
                 data = {}
             data[name] = bool(enabled)
-            write_json(FEATURES_FILE, data)
+            write_json_atomic(FEATURES_FILE, data)
         FEATURES[name] = bool(enabled)
         return True
     except Exception as e:
@@ -996,24 +1001,24 @@ FEATURES = load_features()
 # ------------------------------------------------------
 # monitors.json 專用：一次 read-modify-write（有檔案鎖）
 # ------------------------------------------------------
+def _update_json_list_with_lock(file_path: str, mutator):
+    """Reads, modifies, and writes a JSON file (expected to be a list) under a file lock."""
+    lock = FileLock(file_path + ".lock")
+    with lock:
+        data = read_json(file_path, [])
+        mutator(data)
+        write_json_atomic(file_path, data)
+        return data
+
+
 def update_monitors(mutator):
     """mutator(monitors_list) 會在同一個 lock 裡讀 / 改 / 寫 monitors.json"""
-    lock = FileLock(MONITORS_FILE + ".lock")
-    with lock:
-        monitors = read_json(MONITORS_FILE, [])
-        mutator(monitors)
-        write_json(MONITORS_FILE, monitors)
-        return monitors
+    return _update_json_list_with_lock(MONITORS_FILE, mutator)
 
 
 def update_cruise_monitors(mutator):
     """mutator(monitors_list) -> read/modify/write monitors_cruise.json under lock"""
-    lock = FileLock(CRUISE_MONITORS_FILE + ".lock")
-    with lock:
-        monitors = read_json(CRUISE_MONITORS_FILE, [])
-        mutator(monitors)
-        write_json(CRUISE_MONITORS_FILE, monitors)
-        return monitors
+    return _update_json_list_with_lock(CRUISE_MONITORS_FILE, mutator)
 
 
 def read_cruise_monitors():
@@ -1763,16 +1768,16 @@ def _parse_flexible_date(text: str) -> str | None:
 
 def _normalize_room_token(text: str) -> str:
     s = (text or "").strip()
-    if s.endswith("\u623f"):
+    if s.endswith("房"):
         s = s[:-1]
     return s
 
 
 def _parse_tier(text: str) -> int | None:
     ROOM_TIER_MAP = {
-        1: {"\u5167\u5074", "\u5167\u8259"},
-        2: {"\u6d77\u666f"},
-        3: {"\u9732\u53f0", "\u967d\u53f0", "\u9732\u81fa", "\u967d\u81fa"},
+        1: {"內側", "內艙"},
+        2: {"海景"},
+        3: {"露台", "陽台", "露臺", "陽臺"},
     }
     token = _normalize_room_token(text)
     for tier, synonyms in ROOM_TIER_MAP.items():
@@ -2070,17 +2075,17 @@ def _require_emergency_fields(emergency: dict) -> list:
     for key in required:
         v = emergency.get(key)
         if not v or (isinstance(v, str) and not v.strip()):
-            missing.append(f"\u7dca\u6025\u806f\u7d61\u4eba:{key}")
+            missing.append(f"緊急聯絡人:{key}")
     return missing
 
 
 def _resolve_allotment(access_token: str, date: str, tier: int, pax: int) -> tuple[dict | None, str | None]:
     itinerary_name = fetch_itinerary(access_token, date)
     if not itinerary_name:
-        return None, "\u8a72\u65e5\u671f\u6c92\u6709\u63a2\u7d22\u661f\u865f\u822a\u7a0b"
+        return None, "該日期沒有探索星號航程"
     port_info = fetch_port(access_token, date)
     if not port_info or port_info.get("departure_port") is None:
-        return None, "\u67e5\u7121\u53ef\u7528\u51fa\u767c\u6e2f\u53e3"
+        return None, "查無可用出發港口"
 
     params = {
         "itinerary_name": itinerary_name,
@@ -2097,23 +2102,23 @@ def _resolve_allotment(access_token: str, date: str, tier: int, pax: int) -> tup
             timeout=20,
         )
     except Exception:
-        return None, "\u67e5\u8a62\u623f\u578b\u5931\u6557\uff0c\u8acb\u7a0d\u5f8c\u518d\u8a66"
+        return None, "查詢房型失敗，請稍後再試"
     if r.status_code in (401, 403):
         trigger_relogin("cabin-allotment", f"status={r.status_code}")
-        return None, "Token \u5df2\u904e\u671f\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66"
+        return None, "Token 已過期，請重新登入 SDC 後再試"
     try:
         r.raise_for_status()
     except Exception:
-        return None, "\u67e5\u8a62\u623f\u578b\u5931\u6557\uff0c\u8acb\u7a0d\u5f8c\u518d\u8a66"
+        return None, "查詢房型失敗，請稍後再試"
     data = r.json() or {}
     items = data.get("items") if isinstance(data, dict) else None
     if not isinstance(items, list):
         items = []
 
     tier_keywords = {
-        3: ["balcony", "terrace", "balcony cabin", "\u9732\u53f0", "\u967d\u53f0"],
-        2: ["oceanview", "ocean view", "\u6d77\u666f"],
-        1: ["interior", "\u5167\u5074", "\u5167\u8259"],
+        3: ["balcony", "terrace", "balcony cabin", "露台", "陽台"],
+        2: ["oceanview", "ocean view", "海景"],
+        1: ["interior", "內側", "內艙"],
     }
     keywords = tier_keywords.get(tier, [])
 
@@ -2127,9 +2132,9 @@ def _resolve_allotment(access_token: str, date: str, tier: int, pax: int) -> tup
 
     picked = pick_item()
     if not picked:
-        TIER_LABEL = {1: "\u5167\u5074", 2: "\u6d77\u666f", 3: "\u9732\u53f0"}
-        label = TIER_LABEL.get(tier, "\u6307\u5b9a")
-        return None, f"\u6c92\u6709{label}\u623f"
+        TIER_LABEL = {1: "內側", 2: "海景", 3: "露台"}
+        label = TIER_LABEL.get(tier, "指定")
+        return None, f"沒有{label}房"
 
     try:
         print(f"[{ts()}] [CRUISE] allotment picked keys: {list(picked.keys())}", flush=True)
@@ -2159,7 +2164,7 @@ def _resolve_allotment(access_token: str, date: str, tier: int, pax: int) -> tup
     if not result["itinerary_id"]:
         missing.append("itinerary_id")
     if missing:
-        return None, f"\u7121\u6cd5\u53d6\u5f97\u8a02\u623f\u53c3\u6578\uff0c\u7f3a\u5c11\uff1a{', '.join(missing)}"
+        return None, f"無法取得訂房參數，缺少：{', '.join(missing)}"
     return result, None
 
 
@@ -2188,23 +2193,23 @@ def _build_booking_payload(
 
 def _format_passenger_details(passenger: dict) -> str:
     return "\n".join([
-        f"\u4e2d\u6587\u540d\uff1a{passenger.get('chinese_name') or ''}",
-        f"English\uff1a{passenger.get('first_name')} {passenger.get('last_name')}",
-        f"\u8b77\u7167\uff1a{passenger.get('passport_number')} / {passenger.get('passport_issuance_date')} / {passenger.get('passport_expiry_date')}",
-        f"\u767c\u7167\u5730\uff1a{passenger.get('passport_issuance_country')}",
-        f"\u751f\u65e5\uff1a{passenger.get('date_of_birth')}  \u6027\u5225\uff1a{passenger.get('gender')}",
-        f"Email\uff1a{passenger.get('email')} / {passenger.get('re-email')}",
-        f"\u96fb\u8a71\uff1a{passenger.get('phone_country_code')} {passenger.get('phone_number')}",
+        f"中文名：{passenger.get('chinese_name') or ''}",
+        f"English：{passenger.get('first_name')} {passenger.get('last_name')}",
+        f"護照：{passenger.get('passport_number')} / {passenger.get('passport_issuance_date')} / {passenger.get('passport_expiry_date')}",
+        f"發照地：{passenger.get('passport_issuance_country')}",
+        f"生日：{passenger.get('date_of_birth')}  性別：{passenger.get('gender')}",
+        f"Email：{passenger.get('email')} / {passenger.get('re-email')}",
+        f"電話：{passenger.get('phone_country_code')} {passenger.get('phone_number')}",
     ])
 
 
 def _format_emergency_details(emergency: dict) -> str:
     return "\n".join([
-        f"\u4e2d\u6587\u540d\uff1a{emergency.get('chinese_name') or ''}",
-        f"English\uff1a{emergency.get('given_name')} {emergency.get('surname')}",
-        f"\u95dc\u4fc2\uff1a{emergency.get('relationship_type')}",
-        f"\u96fb\u8a71\uff1a{emergency.get('phone_country_code')} +{emergency.get('phone_country_code_number')} {emergency.get('phone_number')}",
-        f"Email\uff1a{emergency.get('email')}",
+        f"中文名：{emergency.get('chinese_name') or ''}",
+        f"English：{emergency.get('given_name')} {emergency.get('surname')}",
+        f"關係：{emergency.get('relationship_type')}",
+        f"電話：{emergency.get('phone_country_code')} +{emergency.get('phone_country_code_number')} {emergency.get('phone_number')}",
+        f"Email：{emergency.get('email')}",
     ])
 
 
@@ -2234,7 +2239,7 @@ def _prepare_passengers_from_private(names: list[str]) -> tuple[dict | None, lis
     def build_passenger(token: str, label: str) -> dict | None:
         entry = _match_alias(token, people)
         if not entry:
-            errors.append(f"\u627e\u4e0d\u5230\u4e58\u5ba2\u8cc7\u6599\uff1a{label}({token})")
+            errors.append(f"找不到{label}資料：{label}({token})")
             return None
         passenger = entry.get("passenger") if isinstance(entry.get("passenger"), dict) else {}
         overrides = entry.get("passenger_overrides") if isinstance(entry.get("passenger_overrides"), dict) else {}
@@ -2257,28 +2262,53 @@ def _prepare_passengers_from_private(names: list[str]) -> tuple[dict | None, lis
             require_passport=require_passport,
         )
         if missing:
-            errors.append("\u7f3a\u5c11\u5fc5\u586b\u6b04\u4f4d\uff1a" + ", ".join(missing))
+            errors.append("缺少必填欄位：" + ", ".join(missing))
             return None
         return base
 
-    main = build_passenger(names[0], "\u4e3b\u4e58\u5ba2")
+    main = build_passenger(names[0], "主乘客", True)
     companions = []
     for idx, token in enumerate(names[1:-1], 1):
-        p = build_passenger(token, f"\u540c\u884c{idx}")
+        p = build_passenger(token, f"同行{idx}", False)
         if p:
             companions.append(p)
 
     emergency_entry = _match_alias(names[-1], emergencies)
     emergency = None
     if not emergency_entry:
-        errors.append(f"\u627e\u4e0d\u5230\u7dca\u6025\u806f\u7d61\u4eba\uff1a{names[-1]}")
+        errors.append(f"找不到緊急聯絡人：{names[-1]}")
     else:
         emergency = emergency_entry.get("emergency_contact") if isinstance(emergency_entry.get("emergency_contact"), dict) else {}
         missing_emg = _require_emergency_fields(emergency)
         if missing_emg:
-            errors.append("\u7dca\u6025\u806f\u7d61\u4eba\u7f3a\u6b04\uff1a" + ", ".join(missing_emg))
+            errors.append("緊急聯絡人缺欄：" + ", ".join(missing_emg))
 
     return main, companions, emergency, errors
+
+
+def _send_cruise_booking_reply(flow_result: dict, line_user_id: str, reply_token: str | None = None) -> bool:
+    """Helper to send cruise booking results via Line."""
+    if not flow_result or not flow_result.get("ok"):
+        return False
+
+    summary = flow_result.get("summary_text") or ""
+    messages = []
+    if summary:
+        for chunk in _split_line_messages(summary):
+            messages.append(TextSendMessage(text=chunk))
+
+    if not messages:
+        return False
+
+    try:
+        if reply_token:
+            cruise_line_bot_api.reply_message(reply_token, messages[:5])
+        else:
+            cruise_line_bot_api.push_message(line_user_id, messages[:5])
+        return True
+    except Exception as e:
+        print(f"[{ts()}] [CRUISE] Failed to send booking reply to {line_user_id}: {e}", flush=True)
+        return False
 
 
 def process_cruise_text_command(
@@ -2304,11 +2334,11 @@ def process_cruise_text_command(
     if not raw_text:
         result["errors"].append("missing text")
         return result
-    if not raw_text.startswith(("\u8a02\u623f", "\u8ba2\u623f")):
+    if not raw_text.startswith(("訂房", "订房")):
         result["errors"].append("unsupported command")
         return result
 
-    json_mode = raw_text.startswith(("\u8a02\u623f {", "\u8ba2\u623f {"))
+    json_mode = raw_text.startswith(("訂房 {", "订房 {"))
     if json_mode:
         payload_text = raw_text[2:].strip()
         if not payload_text:
@@ -2324,7 +2354,7 @@ def process_cruise_text_command(
         result["parsed"] = {"send_flag": True}
         if dry_run:
             result["actions"]["booking"] = {"attempted": False, "booking_request": payload}
-            result["actions"]["paylink"] = {"attempted": False, "paylink_record": {"ttl_seconds": payload.get("ttl_seconds")}}
+            result["actions"]["paylink"] = {"attempted": False, "paylink_record": {"ttl_seconds": payload.get("ttl_seconds")}} # Added ttl_seconds here
             result["ok"] = True
             return result
 
@@ -2348,30 +2378,9 @@ def process_cruise_text_command(
             "expires_at": flow_result.get("expires_at"),
             "summary_text": flow_result.get("summary_text"),
         })
-        resolved_base = get_public_base_url(request)
-        print(
-            f"[{ts()}] [CRUISE] process_cruise_text_command base_url "
-            f"PUBLIC_BASE_URL raw='{PUBLIC_BASE_URL}' resolved_base='{resolved_base}' "
-            f"pay_url='{flow_result.get('pay_url')}'",
-            flush=True,
-        )
 
-        print(
-            f"[{ts()}] [CRUISE] command paylink returned pay_url='{flow_result.get('pay_url')}'",
-            flush=True,
-        )
         if reply or reply_token:
-            summary = flow_result.get("summary_text") or ""
-            pay_url = flow_result.get("pay_url") or ""
-            messages = []
-            if summary:
-                for chunk in _split_line_messages(summary):
-                    messages.append(TextSendMessage(text=chunk))
-            if messages:
-                if reply_token:
-                    cruise_line_bot_api.reply_message(reply_token, messages[:5])
-                else:
-                    cruise_line_bot_api.push_message(line_user_id, messages[:5])
+            if _send_cruise_booking_reply(flow_result, line_user_id, reply_token):
                 result["sent_to"] = line_user_id
         return result
 
@@ -2381,7 +2390,7 @@ def process_cruise_text_command(
             "格式錯誤，請用：\n"
             "訂房 <日期> <房型> <主乘客> [同行乘客...] <緊急聯絡人>\n"
             "日期支援：2026-02-22 / 2026/2/22 / 2026.02.22 / 20260222\n"
-            "房型：內側 / 海景 / 露臺 / 陽台（露臺=陽台）"
+            "房型：內側 / 海景 / 露台 / 陽台（露台=陽台）"
         )
         result["error_type"] = "parse_error"
         return result
@@ -2409,7 +2418,7 @@ def process_cruise_text_command(
             "格式錯誤，請用：\n"
             "訂房 <日期> <房型> <主乘客> [同行乘客...] <緊急聯絡人>\n"
             "日期支援：2026-02-22 / 2026/2/22 / 2026.02.22 / 20260222\n"
-            "房型：內側 / 海景 / 露臺 / 陽台（露臺=陽台）"
+            "房型：內側 / 海景 / 露台 / 陽台（露台=陽台）"
         )
         result["error_type"] = "parse_error"
         return result
@@ -2470,32 +2479,12 @@ def process_cruise_text_command(
         "expires_at": flow_result.get("expires_at"),
         "summary_text": flow_result.get("summary_text"),
     })
-    resolved_base = get_public_base_url(request)
-    print(
-        f"[{ts()}] [CRUISE] process_cruise_text_command base_url "
-        f"PUBLIC_BASE_URL raw='{PUBLIC_BASE_URL}' resolved_base='{resolved_base}' "
-        f"pay_url='{flow_result.get('pay_url')}'",
-        flush=True,
-    )
 
-    print(
-        f"[{ts()}] [CRUISE] command paylink returned pay_url='{flow_result.get('pay_url')}'",
-        flush=True,
-    )
     if CRUISE_RELOGIN_NEEDED:
         result["relogin_required"] = True
+
     if reply or reply_token:
-        summary = flow_result.get("summary_text") or ""
-        pay_url = flow_result.get("pay_url") or ""
-        messages = []
-        if summary:
-            for chunk in _split_line_messages(summary):
-                messages.append(TextSendMessage(text=chunk))
-        if messages:
-            if reply_token:
-                cruise_line_bot_api.reply_message(reply_token, messages[:5])
-            else:
-                cruise_line_bot_api.push_message(line_user_id, messages[:5])
+        if _send_cruise_booking_reply(flow_result, line_user_id, reply_token):
             result["sent_to"] = line_user_id
     return result
 
@@ -2556,11 +2545,11 @@ def _resolve_passengers_and_emergency(
                     base = _merge_dict(passenger, overrides)
                 else:
                     return None, (
-                        f"主乘客帳號不符：目前登入 customer_id={login_customer_id}，主乘客 mmid={mmid}。"
-                        "請切換登入主乘客帳號後再試。"
+                        f"主乘客帳號不合：當前登入 customer_id={login_customer_id} ，主乘客 mmid={mmid} 。"
+                        "請切換登入主乘客帳號後再試"
                     )
             else:
-                return None, "主乘客必須在 private_people.json 設定 is_member=true 並填 mmid（用於登入者比對）"
+                return None, "主乘客必須在 private_people.json 設定 is_member=true 並填 mmid (用於登入者比對)"
         else:
             if is_member:
                 mmid = entry.get("mmid")
@@ -2584,7 +2573,7 @@ def _resolve_passengers_and_emergency(
                 try:
                     fc_list_local = get_fc_list()
                 except PermissionError:
-                    return None, "Token 已過期，請重新登入 SDC 後再試"
+                    return None, "Token已過期，請重新登入SDC後再試"
 
                 overrides = {}
                 hints = {}
@@ -2630,30 +2619,24 @@ def _resolve_passengers_and_emergency(
         if base.get("email"):
             base["re-email"] = base.get("email")
         if is_main and require_phone and not base.get("phone_number"):
-            return None, "主乘客缺少 phone_number，請到 SDC 常用旅客/會員資料補齊後再試"
-        if is_main:
-            require_contact = True
-            require_passport = True
-        else:
-            require_contact = False
-            require_passport = is_member
+            return None, "主乘客缺少 phone_number，請到 SDC 常用旅客資料補齊再試"
         missing = _require_fields(
             base,
             label,
-            require_contact=require_contact,
-            require_passport=require_passport,
+            require_contact=is_main,
+            require_passport=is_member or is_main,
         )
         if missing:
             return None, "缺少必填欄位：" + ", ".join(missing)
         return base, None
 
-    main_passenger, err = build_passenger(main_token, "\u4e3b\u4e58\u5ba2", True)
+    main_passenger, err = build_passenger(main_token, "主乘客", True)
     if err:
         return None, None, None, err
 
     companions = []
     for idx, token in enumerate(companion_tokens, 1):
-        passenger, err = build_passenger(token, f"\u540c\u884c{idx}", False)
+        passenger, err = build_passenger(token, f"同行{idx}", False)
         if err:
             return None, None, None, err
         companions.append(passenger)
@@ -2664,7 +2647,7 @@ def _resolve_passengers_and_emergency(
     emergency = emergency_entry.get("emergency_contact") if isinstance(emergency_entry.get("emergency_contact"), dict) else {}
     missing_emg = _require_emergency_fields(emergency)
     if missing_emg:
-        return None, None, None, "緊急聯絡人缺少必要欄位：" + ", ".join(missing_emg)
+        return None, None, None, "緊急聯絡人缺欄：" + ", ".join(missing_emg)
 
     return main_passenger, companions, emergency, None
 
@@ -2678,7 +2661,7 @@ def _book_and_paylink_with_people(
 ) -> tuple[dict, int]:
     access_token = get_latest_access_token()
     if not access_token:
-        return {"ok": False, "error": "\u8acb\u5148\u624b\u52d5\u767b\u5165\u4e00\u6b21\u8b93 Token Sync \u56de\u704c"}, 401
+        return {"ok": False, "error": "請先手動登入一次讓 Token Sync 回灌"}, 401
 
     pax = max(len(names) - 1, 0)
     allotment, err = _resolve_allotment(access_token, date, tier, pax)
@@ -2712,11 +2695,11 @@ def _book_and_paylink_with_people(
         r = requests.post(draft_url, headers=headers, json=draft_payload, timeout=20)
     except Exception as ex:
         print(f"[{ts()}] [CRUISE] trace={trace_id} draft error={type(ex).__name__}", flush=True)
-        return {"ok": False, "error": "\u5efa\u7acb\u8349\u7a3f\u5931\u6557\uff0c\u8acb\u7a0d\u5f8c\u91cd\u8a66"}, 502
+        return {"ok": False, "error": "建立草稿失敗，請稍後重試"}, 502
     if r.status_code == 401:
         trigger_relogin("draft", f"status={r.status_code}")
         _log_backend_response(trace_id, "draft", r)
-        return {"ok": False, "error": "Token \u5df2\u904e\u671f\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66"}, 401
+        return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
     if r.status_code >= 400:
         _log_backend_response(trace_id, "draft", r)
         body_head = ""
@@ -2733,14 +2716,14 @@ def _book_and_paylink_with_people(
     draft_data = _parse_json_response(r) or {}
     booking_id = draft_data.get("booking_id")
     if not booking_id:
-        return {"ok": False, "error": "\u5f8c\u7aef\u56de\u50b3\u7f3a\u5c11 booking_id"}, 502
+        return {"ok": False, "error": "後端回傳缺少 booking_id"}, 502
 
     check_url = f"{CRUISE_BACKEND_BASE}/booking/check-status/{booking_id}"
     r = requests.get(check_url, headers=headers, timeout=20)
     if r.status_code == 401:
         trigger_relogin("check-status", f"status={r.status_code}")
         _log_backend_response(trace_id, "check-status", r)
-        return {"ok": False, "error": "Token \u5df2\u904e\u671f\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66"}, 401
+        return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
     r.raise_for_status()
     check_data = _parse_json_response(r) or {}
     numeric_id = check_data.get("id") or check_data.get("booking_id")
@@ -2749,14 +2732,14 @@ def _book_and_paylink_with_people(
     except Exception:
         numeric_id = 0
     if numeric_id <= 0:
-        return {"ok": False, "error": "\u7121\u6cd5\u53d6\u5f97 numeric_id"}, 502
+        return {"ok": False, "error": "無法取得 numeric_id"}, 502
 
     booking_url = f"{CRUISE_BACKEND_BASE}/booking/{numeric_id}"
     r = requests.get(booking_url, headers=headers, timeout=20)
     if r.status_code == 401:
         trigger_relogin("booking", f"status={r.status_code}")
         _log_backend_response(trace_id, "booking", r)
-        return {"ok": False, "error": "Token \u5df2\u904e\u671f\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66"}, 401
+        return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
     r.raise_for_status()
     booking_payload = _parse_json_response(r) or {}
     if isinstance(booking_payload, dict) and isinstance(booking_payload.get("data"), dict):
@@ -2764,7 +2747,7 @@ def _book_and_paylink_with_people(
     else:
         booking_summary = booking_payload if isinstance(booking_payload, dict) else {}
     if not isinstance(booking_summary, dict):
-        return {"ok": False, "error": "\u8a02\u55ae\u8cc7\u6599\u683c\u5f0f\u932f\u8aa4"}, 502
+        return {"ok": False, "error": "訂單資料格式錯誤"}, 502
 
     latest_record_updated_time = _extract_record_updated_time(booking_summary, record_updated_time)
     if not latest_record_updated_time:
@@ -2772,7 +2755,7 @@ def _book_and_paylink_with_people(
         if r.status_code == 401:
             trigger_relogin("booking-refresh", f"status={r.status_code}")
             _log_backend_response(trace_id, "booking-refresh", r)
-            return {"ok": False, "error": "Token \u5df2\u904e\u671f\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66"}, 401
+            return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
         r.raise_for_status()
         booking_payload = _parse_json_response(r) or {}
         if isinstance(booking_payload, dict) and isinstance(booking_payload.get("data"), dict):
@@ -2781,7 +2764,7 @@ def _book_and_paylink_with_people(
             booking_summary = booking_payload if isinstance(booking_payload, dict) else {}
         latest_record_updated_time = _extract_record_updated_time(booking_summary, None)
         if not latest_record_updated_time:
-            return {"ok": False, "error": "\u7121\u6cd5\u53d6\u5f97 recordUpdatedTime\uff0c\u8acb\u91cd\u8a66"}, 400
+            return {"ok": False, "error": "無法取得 recordUpdatedTime，請重試"}, 400
 
     require_phone = non_member_surcharge_id is not None
     main_passenger, companions, emergency, err = _resolve_passengers_and_emergency(
@@ -2805,16 +2788,16 @@ def _book_and_paylink_with_people(
     if r.status_code == 401:
         trigger_relogin("booking-update", f"status={r.status_code}")
         _log_backend_response(trace_id, "booking-update", r)
-        return {"ok": False, "error": "Token \u5df2\u904e\u671f\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66"}, 401
+        return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
     if r.status_code >= 400:
         _log_backend_response(trace_id, "booking-update", r)
-        return {"ok": False, "error": "\u66f4\u65b0\u4e58\u5ba2\u8cc7\u6599\u5931\u6557"}, 502
+        return {"ok": False, "error": "更新乘客資料失敗"}, 502
 
     r = requests.get(booking_url, headers=headers, timeout=20)
     if r.status_code == 401:
         trigger_relogin("booking-refresh", f"status={r.status_code}")
         _log_backend_response(trace_id, "booking-refresh", r)
-        return {"ok": False, "error": "Token \u5df2\u904e\u671f\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66"}, 401
+        return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
     r.raise_for_status()
     booking_payload = _parse_json_response(r) or {}
     if isinstance(booking_payload, dict) and isinstance(booking_payload.get("data"), dict):
@@ -2827,7 +2810,7 @@ def _book_and_paylink_with_people(
         if r.status_code == 401:
             trigger_relogin("booking-refresh", f"status={r.status_code}")
             _log_backend_response(trace_id, "booking-refresh", r)
-            return {"ok": False, "error": "Token \u5df2\u904e\u671f\uff0c\u8acb\u91cd\u65b0\u767b\u5165 SDC \u5f8c\u518d\u8a66"}, 401
+            return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
         r.raise_for_status()
         booking_payload = _parse_json_response(r) or {}
         if isinstance(booking_payload, dict) and isinstance(booking_payload.get("data"), dict):
@@ -2836,7 +2819,7 @@ def _book_and_paylink_with_people(
             booking_summary = booking_payload if isinstance(booking_payload, dict) else {}
         latest_record_updated_time = _extract_record_updated_time(booking_summary, None)
         if not latest_record_updated_time:
-            return {"ok": False, "error": "\u7121\u6cd5\u53d6\u5f97 recordUpdatedTime\uff0c\u8acb\u91cd\u8a66"}, 400
+            return {"ok": False, "error": "無法取得 recordUpdatedTime，請重試"}, 400
 
     payment_method = _build_payment_items("credit_card", include_surcharge=non_member_surcharge_id is not None)
     if not payment_method:
@@ -2848,7 +2831,7 @@ def _book_and_paylink_with_people(
         ttl_seconds=ttl_seconds,
     )
     if not paylink_entry:
-        return {"ok": False, "error": "\u7121\u6cd5\u5efa\u7acb\u4ed8\u6b3e\u9023\u7d50"}, 500
+        return {"ok": False, "error": "無法建立付款連結"}, 500
 
     pay_url = f"{_get_base_url()}/cruise/pay/{paylink_entry['code']}"
     _update_paylink_url(paylink_entry["code"], pay_url)
@@ -2877,7 +2860,7 @@ def fetch_itinerary(access_token: str, date: str) -> str | None:
     items = (r.json() or {}).get("items") or []
     for it in items:
         name = it.get("traditional_chinese_name") or ""
-        if "\u63a2\u7d22\u661f\u865f" in name:
+        if "探索星號" in name:
             return name
     return None
 
@@ -2901,8 +2884,8 @@ def fetch_port(access_token: str, date: str) -> dict | None:
         return None
 
     picked = (
-        pick_port("\u57fa\u9686", "KEL")
-        or pick_port("\u9ad8\u96c4", "KHH")
+        pick_port("基隆", "KEL")
+        or pick_port("高雄", "KHH")
         or items[0]
     )
     return {
@@ -2933,21 +2916,21 @@ def calc_alive(m: dict, now: float | None = None) -> bool:
 # ------------------------------------------------------
 # 使用者管理（只有 bot_server 會改，不需要 file lock）
 # ------------------------------------------------------
-def add_user(user_id: str):
-    users = read_json(USERS_FILE, [])
+def _add_user_to_file(user_id: str, file_path: str, log_prefix: str):
+    """Adds a user ID to a JSON list file if it's not already present."""
+    users = read_json(file_path, [])
     if user_id not in users:
         users.append(user_id)
-        write_json(USERS_FILE, users)
-        print(f"[{ts()}] ⭐ 新增使用者:", user_id)
+        write_json_atomic(file_path, users)
+        print(f"[{ts()}] ⭐ {log_prefix}:", user_id)
 
+
+def add_user(user_id: str):
+    _add_user_to_file(user_id, USERS_FILE, "新增使用者")
 
 
 def add_cruise_user(user_id: str):
-    users = read_json(USERS_CRUISE_FILE, [])
-    if user_id not in users:
-        users.append(user_id)
-        write_json(USERS_CRUISE_FILE, users)
-        print(f"[{ts()}] ⭐ 新增 Cruise 使用者:", user_id)
+    _add_user_to_file(user_id, USERS_CRUISE_FILE, "新增 Cruise 使用者")
 
 
 # ------------------------------------------------------
@@ -3061,8 +3044,8 @@ def handle_costco_message(event):
     cmd = parts[0].lower() if parts else ""
     raw_text_lower = raw_text.lower()
 
-    enable_cmds = ("\u555f\u7528", "\u958b\u555f", "\u5f00\u542f", "enable", "on")
-    disable_cmds = ("\u505c\u7528", "\u95dc\u9589", "\u5173\u95ed", "disable", "off")
+    enable_cmds = ("啟用", "開啟", "开启", "enable", "on")
+    disable_cmds = ("停用", "關閉", "关闭", "disable", "off")
     toggle = None
     if cmd in enable_cmds or raw_text in enable_cmds or raw_text_lower in enable_cmds:
         toggle = True
@@ -3075,14 +3058,14 @@ def handle_costco_message(event):
 
     if toggle is not None:
         ok = set_feature("costco", toggle)
-        state = "\u555f\u7528" if toggle else "\u505c\u7528"
+        state = "啟用" if toggle else "停用"
         print(f"[{ts()}] [COSTCO] feature {state}", flush=True)
-        reply = f"\u2705 Costco \u529f\u80fd\u5df2{state}" if ok else "\u2757 \u7121\u6cd5\u66f4\u65b0 features.json"
+        reply = f"✅ Costco 功能已{state}" if ok else "❗ 無法更新 features.json"
         costco_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
 
     if not feature_enabled("costco"):
-        reply = "Costco \u529f\u80fd\u76ee\u524d\u505c\u7528"
+        reply = "Costco 功能目前停用"
         costco_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
 
@@ -3269,7 +3252,7 @@ def handle_costco_message(event):
         "可用指令：\n\n"
         "📦 庫存 / stock  → 立即重查所有庫存\n"
         "📄 列出監控 / 監控 / list  → 顯示監控清單與狀態\n"
-        "\u529F\u80FD\u958B\u95DC\uff1a\u555f\u7528 / \u505c\u7528\n"
+        "功能開關：啟用 / 停用\n"
         "➕ 新增 [URL] [秒數] / add [URL] [秒數]  (未輸入秒數預設3分鐘)\n"
         "➖ 移除 [URL] / remove [URL]"
     )
@@ -3285,8 +3268,8 @@ def handle_cruise_message(event):
     raw_text = (event.message.text or "").strip()
     raw_text_lower = raw_text.lower()
 
-    enable_cmds = ("\u555f\u7528", "\u958b\u555f", "\u5f00\u542f", "enable", "on")
-    disable_cmds = ("\u505c\u7528", "\u95dc\u9589", "\u5173\u95ed", "disable", "off")
+    enable_cmds = ("啟用", "開啟", "开启", "enable", "on")
+    disable_cmds = ("停用", "關閉", "关闭", "disable", "off")
     toggle = None
     if raw_text in enable_cmds or raw_text_lower in enable_cmds:
         toggle = True
@@ -3299,14 +3282,14 @@ def handle_cruise_message(event):
 
     if toggle is not None:
         ok = set_feature("cruise_daemon", toggle)
-        state = "\u555f\u7528" if toggle else "\u505c\u7528"
+        state = "啟用" if toggle else "停用"
         print(f"[{ts()}] [CRUISE] feature {state}", flush=True)
-        reply = f"\u2705 Cruise \u529f\u80fd\u5df2{state}" if ok else "\u2757 \u7121\u6cd5\u66f4\u65b0 features.json"
+        reply = f"✅ Cruise 功能已{state}" if ok else "❗ 無法更新 features.json"
         cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
 
     if not feature_enabled("cruise_daemon"):
-        reply = "Cruise \u529f\u80fd\u76ee\u524d\u505c\u7528"
+        reply = "Cruise 功能目前停用"
         cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
 
@@ -3434,13 +3417,13 @@ def handle_cruise_message(event):
             for i in range(0, len(remaining), 5):
                 cruise_line_bot_api.push_message(user_id, remaining[i:i+5])
         return
-    if raw_text.startswith(("\u8a02\u623f", "\u8ba2\u623f")):
+    if raw_text.startswith(("訂房", "订房")):
         if not is_cruise_daemon_enabled():
-            reply = "\u8a02\u623f\u529f\u80fd\u76ee\u524d\u672a\u555f\u7528"
+            reply = "訂房功能目前未啟用"
             cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
             return
         if not is_cruise_admin(event.source.user_id):
-            reply = "\u4f60\u6c92\u6709\u8a02\u623f\u6b0a\u9650\uff08\u50c5\u9650\u7ba1\u7406\u8005\uff09"
+            reply = "你沒有訂房權限（僅限管理者）"
             cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
             return
         result = process_cruise_text_command(
@@ -3482,16 +3465,6 @@ def handle_cruise_message(event):
 
     list_keywords = ("列出監控", "監控列表", "顯示監控", "列出", "列表","LIST","List","list")
     delete_keywords = ("刪除", "移除", "取消","DELETE","Delete","delete")
-
-    def parse_date_text(text: str) -> str | None:
-        m = re.search(r"(\d{4})[-/\.]?(\d{2})[-/\.]?(\d{2})", text)
-        if not m:
-            return None
-        y, mo, d = (int(v) for v in m.groups())
-        try:
-            return datetime(y, mo, d).strftime("%Y-%m-%d")
-        except ValueError:
-            return None
 
     if any(k in raw_text for k in list_keywords):
         monitors = read_cruise_monitors()
@@ -3572,9 +3545,9 @@ def handle_cruise_message(event):
         return
 
     if any(k in raw_text for k in delete_keywords):
-        date = parse_date_text(raw_text)
+        date = _parse_flexible_date(raw_text)
         if not date:
-            reply = "\u8ACB\u8F38\u5165\uFF1A\u522A\u9664 YYYY-MM-DD\uFF08\u4E5F\u652F\u63F4 YYYYMMDD / YYYY/MM/DD / YYYY.MM.DD\uFF09"
+            reply = "請輸入：刪除 YYYY-MM-DD（也支援 YYYYMMDD / YYYY/MM/DD / YYYY.MM.DD）"
             cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
             return
         result = {"removed": False}
@@ -3593,69 +3566,69 @@ def handle_cruise_message(event):
             reply = f"找不到監控：{date}"
         cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
-    date = parse_date_text(raw_text)
+    date = _parse_flexible_date(raw_text)
     if not date:
         help_text = (
-            "\u53ef\u7528\u6307\u4ee4\uff1a\n\n"
-            "\u5217\u51fa\u76e3\u63a7 / \u76e3\u63a7\u5217\u8868 / \u986f\u793a\u76e3\u63a7 / \u5217\u51fa / \u5217\u8868\n"
-            "\u522A\u9664/\u79FB\u9664/\u53D6\u6D88 YYYY-MM-DD\uFF08\u4E5F\u652F\u63F4 YYYYMMDD / YYYY/MM/DD / YYYY.MM.DD\uFF09\n"
-            "\u529F\u80FD\u958B\u95DC\uff1a\u555f\u7528 / \u505c\u7528\n"
-            "YYYY-MM-DD [\u5167\u5074/\u6d77\u666f/\u9732\u53f0]\n"
-            "\u4f8b\u5982\uff1a2026-02-27 \u6d77\u666f"
+            "可用指令：\n\n"
+            "列出監控 / 監控列表 / 顯示監控 / 列出 / 列表\n"
+            "刪除/移除/取消 YYYY-MM-DD（也支援 YYYYMMDD / YYYY/MM/DD / YYYY.MM.DD）\n"
+            "功能開關：啟用 / 停用\n"
+            "YYYY-MM-DD [內側/海景/露台]\n"
+            "例如：2026-02-27 海景"
         )
         cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=help_text))
         return
 
-    if any(k in raw_text for k in ("\u9732\u53f0", "\u9732\u81fa", "\u967d\u53f0")):
-        tier_short = "\u9732\u53f0"
+    if any(k in raw_text for k in ("露台", "露臺", "陽台")):
+        tier_short = "露台"
         notify_mode = "above_baseline_first_seen"
         baseline_tier = 2
-    elif "\u6d77\u666f" in raw_text:
-        tier_short = "\u6d77\u666f"
+    elif "海景" in raw_text:
+        tier_short = "海景"
         notify_mode = "above_baseline_first_seen"
         baseline_tier = 1
-    elif ("\u5167\u5074" in raw_text) or ("\u5167\u8259" in raw_text):
-        tier_short = "\u5167\u5074"
+    elif ("內側" in raw_text) or ("內艙" in raw_text):
+        tier_short = "內側"
         notify_mode = "per_tier_first_seen"
         baseline_tier = 1
     else:
-        tier_short = "\u5167\u5074"
+        tier_short = "內側"
         notify_mode = "per_tier_first_seen"
         baseline_tier = 1
 
     if notify_mode == "per_tier_first_seen":
-        rule_text = "\u5404\u7b49\u7d1a\u9996\u6b21\u51fa\u73fe\u5404\u901a\u77e5\u4e00\u6b21"
+        rule_text = "各等級首次出現各通知一次"
     elif notify_mode == "above_baseline_first_seen":
-        if tier_short == "\u6d77\u666f":
-            rule_text = "\u6d77\u666f/\u9732\u53f0\u51fa\u73fe\u624d\u901a\u77e5"
-        elif tier_short == "\u9732\u53f0":
-            rule_text = "\u53ea\u901a\u77e5\u9732\u53f0"
+        if tier_short == "海景":
+            rule_text = "海景/露台出現才通知"
+        elif tier_short == "露台":
+            rule_text = "只通知露台"
         else:
-            rule_text = f"{tier_short}\u4ee5\u4e0a\u624d\u901a\u77e5"
+            rule_text = f"{tier_short}以上才通知"
     else:
-        rule_text = f"{tier_short}\u4ee5\u4e0a\u624d\u901a\u77e5"
+        rule_text = f"{tier_short}以上才通知"
 
     access = _latest_tokens.get("accessToken")
     if not access:
-        reply = "\u8acb\u5148\u624b\u52d5\u767b\u5165\u4e00\u6b21\u8b93 Token Sync \u56de\u704c"
+        reply = "請先手動登入一次讓 Token Sync 回灌"
         cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
 
     try:
         itinerary_name = fetch_itinerary(access, date)
         if not itinerary_name:
-            reply = "\u8a72\u65e5\u671f\u6c92\u6709\u63a2\u7d22\u661f\u865f\u822a\u7a0b"
+            reply = "該日期沒有探索星號航程"
             cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
             return
 
         port_info = fetch_port(access, date)
         if not port_info or port_info.get("departure_port") is None:
-            reply = "\u67e5\u7121\u53ef\u7528\u51fa\u767c\u6e2f\u53e3"
+            reply = "查無可用出發港口"
             cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
             return
     except Exception as ex:
         print(f"[{ts()}] [CRUISE] warn: failed to fetch cruise list:", repr(ex), flush=True)
-        reply = "\u67e5\u8a62\u822a\u7a0b\u5931\u6557，\u8acb\u7a0d\u5f8c\u518d\u8a66"
+        reply = "查詢航程失敗，請稍後再試"
         cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
 
@@ -3682,9 +3655,9 @@ def handle_cruise_message(event):
             "enabled": True,
             "lang": "hant",
             "itinerary_name": itinerary_name,
-            "departure_port": port_info.get("departure_port"),
-            "port_code": port_info.get("port_code"),
-            "port_name": port_info.get("port_name"),
+            "departure_port": port_info.get("departure_port") ,
+            "port_code": port_info.get("port_code") ,
+            "port_name": port_info.get("port_name") or "",
             "baseline_tier": baseline_tier,
             "notify_mode": notify_mode,
             "max_pax": None,
@@ -3699,14 +3672,14 @@ def handle_cruise_message(event):
 
     update_cruise_monitors(mut)
 
-    status = "✅ \u5df2\u66f4\u65b0\u76e3\u63a7" if result["updated"] else "✅ \u5df2\u65b0\u589e\u76e3\u63a7"
+    status = "✅ 已更新監控" if result["updated"] else "✅ 已新增監控"
     reply = (
         f"{status}\n"
-        f"\u65e5\u671f：{date}\n"
-        f"\u51fa\u767c：{port_info.get('port_name', '')}\n"
-        f"\u822a\u7a0b：{itinerary_name}\n"
-        f"\u901a\u77e5\u898f\u5247：{rule_text}\n"
-        "daemon \u6703\u81ea\u52d5\u67e5\u623f"
+        f"日期：{date}\n"
+        f"出發：{port_info.get('port_name', '')}\n"
+        f"航程：{itinerary_name}\n"
+        f"通知規則：{rule_text}\n"
+        "daemon 會自動查房"
     )
     cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
