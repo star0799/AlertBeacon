@@ -3554,12 +3554,12 @@ def handle_cruise_message(event):
         if main_person:
             lines_out.append("主乘客")
             lines_out.extend(_render_person(main_person))
-            lines_out.extend(lines_out.append("")
+            lines_out.append("")
 
         for idx, person in enumerate(fc_list, 1):
             lines_out.append(f"親友{idx}")
             lines_out.extend(_render_person(person))
-            lines_out.extend(lines_out.append("")
+            lines_out.append("")
 
         if not lines_out:
             reply = "親友名單沒有資料"
