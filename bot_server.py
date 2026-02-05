@@ -817,6 +817,8 @@ def trigger_relogin(reason: str, detail: str = "") -> None:
 
     users = read_json(USERS_CRUISE_FILE, [])
     if users:
+        ok_count = 0
+        error_count = 0
         msg_text = (
             "⚠️ Cruise 需要重新登入一次（token 失效/未授權）\n"
             "請開啟 SDC 登入並讓 Token Sync 回灌\n"
@@ -826,8 +828,19 @@ def trigger_relogin(reason: str, detail: str = "") -> None:
         for uid in users:
             try:
                 cruise_line_bot_api.push_message(uid, msg)
+                ok_count += 1
             except Exception as e:
+                error_count += 1
                 print(f"[{ts()}] [CRUISE] relogin notify failed:", uid, repr(e), flush=True)
+        print(
+            f"[{ts()}] [CRUISE] relogin notify done sent={ok_count} errors={error_count} reason={reason}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[{ts()}] [CRUISE] relogin notify skipped: no cruise users reason={reason}",
+            flush=True,
+        )
 
     _latest_tokens.update({
         "accessToken": None,
