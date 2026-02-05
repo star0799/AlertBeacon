@@ -439,7 +439,7 @@ def cruise_pay(code: str):
                     detail = body_head
             last_status = status
             last_detail = detail
-            if status in (401, 403) and attempt == 1:
+            if _is_unauthorized_status(status) and attempt == 1:
                 ok, err = refresh_access_token("payment")
                 if not ok:
                     print(
@@ -458,8 +458,7 @@ def cruise_pay(code: str):
             last_error = ex
             break
 
-    if last_status in (401, 403):
-        trigger_relogin("payment", f"status={last_status}")
+    _handle_unauthorized(last_status, "payment", f"status={last_status}", notify_mode="action_fail")
     if last_status is not None:
         return jsonify({"ok": False, "error": f"payment api failed ({last_status})", "detail": last_detail}), 502
     return jsonify({"ok": False, "error": f"payment api failed", "detail": str(last_error)}), 502
@@ -654,7 +653,7 @@ def cruise_notify():
         max_pax_text = f"（{max_pax}人）" if isinstance(max_pax, int) and max_pax > 0 else ""
 
         text = (
-            f"\U0001F6A2【查到可訂房】{tier_short}{max_pax_text}\n"
+            f"郵輪【查到可訂房】{tier_short}{max_pax_text}\n"
             f"日期：{date}\n"
             f"出發：{port_name}\n"
             f"航程：{itinerary_name}\n"
@@ -809,6 +808,57 @@ def feature_enabled(name: str) -> bool:
     return bool(FEATURES.get(name, True))
 
 
+def _is_unauthorized_status(status: int | None, include_403: bool = True) -> bool:
+    if status is None:
+        return False
+    if include_403:
+        return status in (401, 403)
+    return status == 401
+
+
+def _notify_cruise_action_failed(action: str, detail: str = "") -> None:
+    users = read_json(USERS_CRUISE_FILE, [])
+    msg_text = f"⚠️ Cruise {action} 操作失敗"
+    if detail:
+        msg_text += f"\n{detail}"
+    if users:
+        ok_count = 0
+        error_count = 0
+        msg = TextSendMessage(text=msg_text)
+        for uid in users:
+            try:
+                cruise_line_bot_api.push_message(uid, msg)
+                ok_count += 1
+            except Exception as e:
+                error_count += 1
+                print(f"[{ts()}] [CRUISE] action notify failed:", uid, repr(e), flush=True)
+        print(
+            f"[{ts()}] [CRUISE] action notify done action={action} sent={ok_count} errors={error_count}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[{ts()}] [CRUISE] action notify skipped: no cruise users action={action}",
+            flush=True,
+        )
+
+
+def _handle_unauthorized(
+    status: int | None,
+    reason: str,
+    detail: str = "",
+    include_403: bool = True,
+    notify_mode: str = "relogin",
+) -> bool:
+    if _is_unauthorized_status(status, include_403=include_403):
+        if notify_mode == "action_fail":
+            _notify_cruise_action_failed(reason, detail or f"status={status}")
+        else:
+            trigger_relogin(reason, detail or f"status={status}")
+        return True
+    return False
+
+
 def trigger_relogin(reason: str, detail: str = "") -> None:
     global CRUISE_RELOGIN_NEEDED
     if CRUISE_RELOGIN_NEEDED:
@@ -929,6 +979,7 @@ def get_latest_access_token():
 def refresh_access_token(reason: str) -> tuple[bool, str]:
     refresh_token = _latest_tokens.get("refreshToken")
     if not refresh_token:
+        trigger_relogin("refresh", "missing refreshToken")
         return False, "missing refreshToken"
 
     url = f"{CRUISE_BACKEND_BASE}/auth/customer/refresh"
@@ -942,6 +993,7 @@ def refresh_access_token(reason: str) -> tuple[bool, str]:
             f"[{ts()}] [CRUISE] token refresh failed status=None body_head={body_head}",
             flush=True,
         )
+        trigger_relogin("refresh", "refresh failed None")
         return False, "refresh failed None"
 
     status = r.status_code
@@ -963,6 +1015,8 @@ def refresh_access_token(reason: str) -> tuple[bool, str]:
                 flush=True,
             )
             return True, ""
+        trigger_relogin("refresh", "refresh failed missing tokens")
+        return False, "refresh failed missing tokens"
 
     body_head = ""
     try:
@@ -974,6 +1028,7 @@ def refresh_access_token(reason: str) -> tuple[bool, str]:
         f"[{ts()}] [CRUISE] token refresh failed status={status} body_head={body_head}",
         flush=True,
     )
+    trigger_relogin("refresh", f"refresh failed {status}")
     return False, f"refresh failed {status}"
 
 
@@ -1653,8 +1708,7 @@ def _book_and_paylink_flow(data: dict, base_url: str, trace_id: str) -> tuple[di
         except Exception as ex:
             print(f"[{ts()}] [CRUISE] trace={trace_id} draft error={type(ex).__name__}", flush=True)
             return {"ok": False, "error": "後端建立草稿失敗，請稍後重試"}, 502
-        if r.status_code == 401:
-            trigger_relogin("draft", f"status={r.status_code}")
+        if _handle_unauthorized(r.status_code, "draft", f"status={r.status_code}", include_403=False, notify_mode="action_fail"):
             _log_backend_response(trace_id, "draft", r)
             return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
         if r.status_code >= 400:
@@ -1672,8 +1726,7 @@ def _book_and_paylink_flow(data: dict, base_url: str, trace_id: str) -> tuple[di
         except Exception as ex:
             print(f"[{ts()}] [CRUISE] trace={trace_id} check-status error={type(ex).__name__}", flush=True)
             return {"ok": False, "error": "後端查詢訂單狀態失敗，請稍後重試"}, 502
-        if r.status_code == 401:
-            trigger_relogin("check-status", f"status={r.status_code}")
+        if _handle_unauthorized(r.status_code, "check-status", f"status={r.status_code}", include_403=False, notify_mode="action_fail"):
             _log_backend_response(trace_id, "check-status", r)
             return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
         if r.status_code >= 400:
@@ -1695,8 +1748,7 @@ def _book_and_paylink_flow(data: dict, base_url: str, trace_id: str) -> tuple[di
         except Exception as ex:
             print(f"[{ts()}] [CRUISE] trace={trace_id} booking error={type(ex).__name__}", flush=True)
             return {"ok": False, "error": "後端查詢訂單詳情失敗，請稍後重試"}, 502
-        if r.status_code == 401:
-            trigger_relogin("booking", f"status={r.status_code}")
+        if _handle_unauthorized(r.status_code, "booking", f"status={r.status_code}", include_403=False, notify_mode="action_fail"):
             _log_backend_response(trace_id, "booking", r)
             return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
         if r.status_code >= 400:
@@ -2116,8 +2168,7 @@ def _resolve_allotment(access_token: str, date: str, tier: int, pax: int) -> tup
         )
     except Exception:
         return None, "查詢房型失敗，請稍後再試"
-    if r.status_code in (401, 403):
-        trigger_relogin("cabin-allotment", f"status={r.status_code}")
+    if _handle_unauthorized(r.status_code, "cabin-allotment", f"status={r.status_code}", notify_mode="action_fail"):
         return None, "Token 已過期，請重新登入 SDC 後再試"
     try:
         r.raise_for_status()
@@ -2709,8 +2760,7 @@ def _book_and_paylink_with_people(
     except Exception as ex:
         print(f"[{ts()}] [CRUISE] trace={trace_id} draft error={type(ex).__name__}", flush=True)
         return {"ok": False, "error": "建立草稿失敗，請稍後重試"}, 502
-    if r.status_code == 401:
-        trigger_relogin("draft", f"status={r.status_code}")
+    if _handle_unauthorized(r.status_code, "draft", f"status={r.status_code}", include_403=False, notify_mode="action_fail"):
         _log_backend_response(trace_id, "draft", r)
         return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
     if r.status_code >= 400:
@@ -2733,8 +2783,7 @@ def _book_and_paylink_with_people(
 
     check_url = f"{CRUISE_BACKEND_BASE}/booking/check-status/{booking_id}"
     r = requests.get(check_url, headers=headers, timeout=20)
-    if r.status_code == 401:
-        trigger_relogin("check-status", f"status={r.status_code}")
+    if _handle_unauthorized(r.status_code, "check-status", f"status={r.status_code}", include_403=False, notify_mode="action_fail"):
         _log_backend_response(trace_id, "check-status", r)
         return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
     r.raise_for_status()
@@ -2749,8 +2798,7 @@ def _book_and_paylink_with_people(
 
     booking_url = f"{CRUISE_BACKEND_BASE}/booking/{numeric_id}"
     r = requests.get(booking_url, headers=headers, timeout=20)
-    if r.status_code == 401:
-        trigger_relogin("booking", f"status={r.status_code}")
+    if _handle_unauthorized(r.status_code, "booking", f"status={r.status_code}", include_403=False, notify_mode="action_fail"):
         _log_backend_response(trace_id, "booking", r)
         return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
     r.raise_for_status()
@@ -2765,8 +2813,7 @@ def _book_and_paylink_with_people(
     latest_record_updated_time = _extract_record_updated_time(booking_summary, record_updated_time)
     if not latest_record_updated_time:
         r = requests.get(booking_url, headers=headers, timeout=20)
-        if r.status_code == 401:
-            trigger_relogin("booking-refresh", f"status={r.status_code}")
+        if _handle_unauthorized(r.status_code, "booking-refresh", f"status={r.status_code}", include_403=False, notify_mode="action_fail"):
             _log_backend_response(trace_id, "booking-refresh", r)
             return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
         r.raise_for_status()
@@ -2798,8 +2845,7 @@ def _book_and_paylink_with_people(
 
     update_url = f"{CRUISE_BACKEND_BASE}/customers/v2/booking"
     r = requests.post(update_url, headers=headers, json=booking_payload, timeout=20)
-    if r.status_code == 401:
-        trigger_relogin("booking-update", f"status={r.status_code}")
+    if _handle_unauthorized(r.status_code, "booking-update", f"status={r.status_code}", include_403=False, notify_mode="action_fail"):
         _log_backend_response(trace_id, "booking-update", r)
         return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
     if r.status_code >= 400:
@@ -2807,8 +2853,7 @@ def _book_and_paylink_with_people(
         return {"ok": False, "error": "更新乘客資料失敗"}, 502
 
     r = requests.get(booking_url, headers=headers, timeout=20)
-    if r.status_code == 401:
-        trigger_relogin("booking-refresh", f"status={r.status_code}")
+    if _handle_unauthorized(r.status_code, "booking-refresh", f"status={r.status_code}", include_403=False, notify_mode="action_fail"):
         _log_backend_response(trace_id, "booking-refresh", r)
         return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
     r.raise_for_status()
@@ -2820,8 +2865,7 @@ def _book_and_paylink_with_people(
     latest_record_updated_time = _extract_record_updated_time(booking_summary, latest_record_updated_time)
     if not latest_record_updated_time:
         r = requests.get(booking_url, headers=headers, timeout=20)
-        if r.status_code == 401:
-            trigger_relogin("booking-refresh", f"status={r.status_code}")
+        if _handle_unauthorized(r.status_code, "booking-refresh", f"status={r.status_code}", include_403=False, notify_mode="action_fail"):
             _log_backend_response(trace_id, "booking-refresh", r)
             return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
         r.raise_for_status()
@@ -2866,8 +2910,7 @@ def fetch_itinerary(access_token: str, date: str) -> str | None:
     url = f"{CRUISE_BACKEND_BASE}/customers/list/itinerary"
     params = {"departure_date": date, "lang": "hant", "page": 1}
     r = requests.get(url, params=params, headers=_cruise_headers(access_token), timeout=10)
-    if r.status_code in (401, 403):
-        trigger_relogin("fetch_itinerary", f"status={r.status_code}")
+    if _handle_unauthorized(r.status_code, "fetch_itinerary", f"status={r.status_code}", notify_mode="action_fail"):
         return None
     r.raise_for_status()
     items = (r.json() or {}).get("items") or []
@@ -2882,8 +2925,7 @@ def fetch_port(access_token: str, date: str) -> dict | None:
     url = f"{CRUISE_BACKEND_BASE}/customers/list/port"
     params = {"departure_date": date, "lang": "hant", "page": 1}
     r = requests.get(url, params=params, headers=_cruise_headers(access_token), timeout=10)
-    if r.status_code in (401, 403):
-        trigger_relogin("fetch_port", f"status={r.status_code}")
+    if _handle_unauthorized(r.status_code, "fetch_port", f"status={r.status_code}", notify_mode="action_fail"):
         return None
     r.raise_for_status()
     items = (r.json() or {}).get("items") or []
