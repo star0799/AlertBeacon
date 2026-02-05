@@ -479,4 +479,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"[{ts()}] [DAEMON] 已停止", flush=True)
