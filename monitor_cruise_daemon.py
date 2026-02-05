@@ -9,6 +9,11 @@ BASE = "https://backend-prd.b2m.stardreamcruises.com"
 BOT = "http://127.0.0.1:5000"
 POLL_SECONDS = 60
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE_DIR = os.path.join(BASE_DIR, "state")
+os.makedirs(STATE_DIR, exist_ok=True)
+HEARTBEAT_FILE = os.path.join(STATE_DIR, "heartbeat_cruise_daemon.json")
+HEARTBEAT_INTERVAL_SECONDS = 10
+_last_heartbeat_at = 0.0
 MONITORS_FILE = os.path.join(BASE_DIR, "monitors_cruise.json")
 TIER_RULES_FILE = os.path.join(BASE_DIR, "cabin_name")
 FEATURES_FILE = os.path.join(BASE_DIR, "features.json")
@@ -99,6 +104,24 @@ def write_json(path: str, data):
         print(f"[{ts()}] [DAEMON] warn: failed to write {path}:", repr(e), flush=True)
 
 
+def write_heartbeat(status: str, extra: dict | None = None) -> None:
+    """Write a periodic heartbeat so the watchdog can detect liveness reliably."""
+    global _last_heartbeat_at
+    now = time.time()
+    if (now - _last_heartbeat_at) < HEARTBEAT_INTERVAL_SECONDS:
+        return
+    _last_heartbeat_at = now
+
+    payload: dict = {"ts": now, "ts_str": ts(), "status": status}
+    if isinstance(extra, dict):
+        payload.update(extra)
+
+    try:
+        write_json(HEARTBEAT_FILE, payload)
+    except Exception as e:
+        print(f"[{ts()}] [DAEMON] warn: failed to write heartbeat:", repr(e), flush=True)
+
+
 def read_features():
     defaults = {"cruise_daemon": True}
     try:
@@ -125,6 +148,7 @@ def sleep_with_feature_checks(total_seconds: int):
     end_at = time.time() + total_seconds
     while True:
         if not feature_enabled("cruise_daemon"):
+            write_heartbeat("paused")
             return
         remaining = end_at - time.time()
         if remaining <= 0:
@@ -276,6 +300,7 @@ def main():
             print(f"[{ts()}] ✅ Cruise 監控已啟用，恢復檢查", flush=True)
             paused = False
 
+        write_heartbeat("running")
         try:
             tokens = get_tokens()
             if not tokens:

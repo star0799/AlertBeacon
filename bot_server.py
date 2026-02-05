@@ -22,6 +22,14 @@ PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip()
 
 app = Flask(__name__)
 app.json.ensure_ascii = False
+
+
+@app.get("/health")
+def health():
+    # Lightweight liveness probe for local watchdog.
+    return jsonify({"ok": True, "service": "bot_server", "ts": time.time(), "pid": os.getpid()})
+
+
 @app.get("/_routes")
 def list_routes():
     return jsonify(sorted([str(r) for r in app.url_map.iter_rules()]))

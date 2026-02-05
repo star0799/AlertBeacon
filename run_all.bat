@@ -85,6 +85,10 @@ if "%CRUISE_DAEMON%"=="1" (
   start "[MON] cruise_daemon" cmd /k ""%PY%" "%ROOT%monitor_cruise_daemon.py""
 )
 
+if exist "%ROOT%watchdog_daemon.py" (
+  start "[MON] watchdog" cmd /k ""%PY%" "%ROOT%watchdog_daemon.py""
+)
+
 echo.
 echo Done. Check logs\*.log if something didn't start.
 pause

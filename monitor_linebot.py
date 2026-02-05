@@ -15,6 +15,13 @@ USERS_FILE = "users.json"
 FEATURES_FILE = "features.json"
 FEATURE_CHECK_SECONDS = 10
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE_DIR = os.path.join(BASE_DIR, "state")
+os.makedirs(STATE_DIR, exist_ok=True)
+HEARTBEAT_FILE = os.path.join(STATE_DIR, "heartbeat_costco.json")
+HEARTBEAT_INTERVAL_SECONDS = 10
+_last_heartbeat_at = 0.0
+
 LOG_FOLDER = "logs"
 os.makedirs(LOG_FOLDER, exist_ok=True)
 
@@ -70,6 +77,24 @@ def write_json(path: str, data):
         os.replace(tmp_path, path)
     except Exception as e:
         log(f"⚠️ 寫入 {path} 失敗：{type(e).__name__}: {e}")
+
+def write_heartbeat(status: str = "running", extra: dict | None = None) -> None:
+    """Write a periodic heartbeat so the watchdog can detect liveness reliably."""
+    global _last_heartbeat_at
+    now = time.time()
+    if (now - _last_heartbeat_at) < HEARTBEAT_INTERVAL_SECONDS:
+        return
+    _last_heartbeat_at = now
+
+    payload: dict = {"ts": now, "ts_str": f"{datetime.now():%Y-%m-%d %H:%M:%S}", "status": status}
+    if isinstance(extra, dict):
+        payload.update(extra)
+
+    try:
+        write_json(HEARTBEAT_FILE, payload)
+    except Exception as e:
+        log(f"heartbeat write failed: {type(e).__name__}: {e}")
+
 
 def update_monitors(mutator):
     lock = FileLock(MONITOR_FILE + ".lock")
@@ -195,6 +220,7 @@ def main():
 
     while True:
         if not feature_enabled("costco"):
+            write_heartbeat("paused")
             if not paused:
                 log(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] \u23f8\ufe0f Costco \u76e3\u63a7\u5df2\u505c\u7528\uff0c\u66ab\u505c\u6aa2\u67e5\u4e2d")
                 paused = True
@@ -204,6 +230,7 @@ def main():
             log(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] \u2705 Costco \u76e3\u63a7\u5df2\u555f\u7528\uff0c\u6062\u5fa9\u6aa2\u67e5")
             paused = False
 
+        write_heartbeat("running")
         monitors_snapshot = read_json(MONITOR_FILE, [])
         now_ts = time.time()
 
