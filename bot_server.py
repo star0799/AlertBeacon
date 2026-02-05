@@ -2377,6 +2377,34 @@ def _split_line_messages(text: str, limit: int = 1800) -> list[str]:
     return parts
 
 
+def reply_long_message(
+    api,
+    text: str,
+    reply_token: str | None = None,
+    line_user_id: str | None = None,
+    limit: int = 1800,
+) -> bool:
+    if not text:
+        return False
+    chunks = _split_line_messages(text, limit=limit)
+    messages = [TextSendMessage(text=c) for c in chunks]
+    try:
+        if reply_token:
+            api.reply_message(reply_token, messages[:5])
+            remaining = messages[5:]
+        else:
+            remaining = messages
+        if remaining and line_user_id:
+            for i in range(0, len(remaining), 5):
+                api.push_message(line_user_id, remaining[i:i+5])
+        elif remaining:
+            print(f"[{ts()}] [LINE] reply_long_message dropped {len(remaining)} messages (no user id)", flush=True)
+        return True
+    except Exception as e:
+        print(f"[{ts()}] [LINE] reply_long_message failed: {e}", flush=True)
+        return False
+
+
 def _prepare_passengers_from_private(names: list[str]) -> tuple[dict | None, list | None, dict | None, list]:
     people, emergencies = _load_private_people()
     errors = []
@@ -2437,23 +2465,15 @@ def _send_cruise_booking_reply(flow_result: dict, line_user_id: str, reply_token
         return False
 
     summary = flow_result.get("summary_text") or ""
-    messages = []
-    if summary:
-        for chunk in _split_line_messages(summary):
-            messages.append(TextSendMessage(text=chunk))
-
-    if not messages:
+    if not summary:
         return False
 
-    try:
-        if reply_token:
-            cruise_line_bot_api.reply_message(reply_token, messages[:5])
-        else:
-            cruise_line_bot_api.push_message(line_user_id, messages[:5])
-        return True
-    except Exception as e:
-        print(f"[{ts()}] [CRUISE] Failed to send booking reply to {line_user_id}: {e}", flush=True)
-        return False
+    return reply_long_message(
+        cruise_line_bot_api,
+        summary,
+        reply_token=reply_token,
+        line_user_id=line_user_id,
+    )
 
 
 def process_cruise_text_command(
@@ -3547,16 +3567,12 @@ def handle_cruise_message(event):
             return
 
         text = "\n".join(lines_out)
-        chunks = _split_line_messages(text)
-        messages = [TextSendMessage(text=c) for c in chunks]
-        if event.reply_token:
-            cruise_line_bot_api.reply_message(event.reply_token, messages[:5])
-            remaining = messages[5:]
-        else:
-            remaining = messages
-        if remaining:
-            for i in range(0, len(remaining), 5):
-                cruise_line_bot_api.push_message(user_id, remaining[i:i+5])
+        reply_long_message(
+            cruise_line_bot_api,
+            text,
+            reply_token=event.reply_token,
+            line_user_id=user_id,
+        )
         return
     if raw_text.startswith(("訂房", "订房")):
         if not is_cruise_daemon_enabled():
@@ -3638,7 +3654,7 @@ def handle_cruise_message(event):
         monitors_sorted = sorted(monitors, key=lambda m: parse_date(m.get("date") or ""))
 
         lines = []
-        for m in monitors_sorted[:10]:
+        for m in monitors_sorted:
             date = m.get("date") or ""
             enabled = bool(m.get("enabled", False))
             status_txt = "啟用" if enabled else "停用"
@@ -3680,8 +3696,6 @@ def handle_cruise_message(event):
             lines.append(block)
 
         reply = "\n\n".join(lines)
-        if len(monitors_sorted) > 10:
-            reply = reply + "\n(其餘省略)"
         cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
 
