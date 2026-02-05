@@ -3735,6 +3735,7 @@ def handle_cruise_message(event):
             "可用指令：\n\n"
             "列出監控 / 監控列表 / 顯示監控 / 列出 / 列表\n"
             "刪除/移除/取消 YYYY-MM-DD（也支援 YYYYMMDD / YYYY/MM/DD / YYYY.MM.DD）\n"
+            "緊急聯絡人 / 親友名單\n"
             "功能開關：啟用 / 停用\n"
             "YYYY-MM-DD [內側/海景/露台]\n"
             "例如：2026-02-27 海景"

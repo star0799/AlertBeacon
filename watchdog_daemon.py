@@ -20,11 +20,11 @@ HEARTBEAT_CRUISE_FILE = os.path.join(STATE_DIR, "heartbeat_cruise_daemon.json")
 BOT_HEALTH_URL = "http://127.0.0.1:5000/health"
 NGROK_TUNNELS_URL = "http://127.0.0.1:4040/api/tunnels"
 
-CHECK_INTERVAL_SECONDS = 15
+CHECK_INTERVAL_SECONDS = 60
 STARTUP_GRACE_SECONDS = 60
-FAIL_THRESHOLD = 2
-HEARTBEAT_STALE_COSTCO_SECONDS = 600
-HEARTBEAT_STALE_CRUISE_SECONDS = 600
+FAIL_DURATION_SECONDS = 180  # notify after 3 minutes of consecutive failures
+HEARTBEAT_STALE_COSTCO_SECONDS = 60
+HEARTBEAT_STALE_CRUISE_SECONDS = 60
 
 
 def ts() -> str:
@@ -160,10 +160,10 @@ def main():
 
     started_at = time.time()
     state = {
-        "bot_server": {"fails": 0, "down": False},
-        "ngrok": {"fails": 0, "down": False},
-        "costco": {"fails": 0, "down": False},
-        "cruise_daemon": {"fails": 0, "down": False},
+        "bot_server": {"fails": 0, "down": False, "first_fail_at": None},
+        "ngrok": {"fails": 0, "down": False, "first_fail_at": None},
+        "costco": {"fails": 0, "down": False, "first_fail_at": None},
+        "cruise_daemon": {"fails": 0, "down": False, "first_fail_at": None},
     }
 
     print(f"[{ts()}] [WATCHDOG] started. interval={CHECK_INTERVAL_SECONDS}s grace={STARTUP_GRACE_SECONDS}s", flush=True)
@@ -183,28 +183,46 @@ def main():
             if not enabled:
                 state[name]["fails"] = 0
                 state[name]["down"] = False
+                state[name]["first_fail_at"] = None
                 continue
 
             ok, err = fn()
             if ok:
+                # Recovery notification (only if we previously alerted down)
+                if state[name].get("down"):
+                    now = time.time()
+                    if (now - started_at) >= STARTUP_GRACE_SECONDS:
+                        msg = f"[{ts()}] 【系統監控】{name} 已恢復正常。"
+                        notify(scope, msg, features, costco_api, cruise_api)
+
                 state[name]["fails"] = 0
                 state[name]["down"] = False
+                state[name]["first_fail_at"] = None
                 continue
 
+            now = time.time()
+
+            # record consecutive failure window
+            if not state[name].get("first_fail_at"):
+                state[name]["first_fail_at"] = now
             state[name]["fails"] += 1
 
-            # Avoid noisy alerts during startup; also require consecutive failures.
-            if (time.time() - started_at) < STARTUP_GRACE_SECONDS:
+            # Avoid noisy alerts during startup.
+            if (now - started_at) < STARTUP_GRACE_SECONDS:
                 continue
-            if state[name]["fails"] < FAIL_THRESHOLD:
-                continue
+
+            # Already alerted as down; wait for recovery.
             if state[name]["down"]:
                 continue
 
-            state[name]["down"] = True
-            msg = f"[{ts()}] 【系統監控】偵測到 {name} 可能已停止：{err}。"
-            notify(scope, msg, features, costco_api, cruise_api)
+            # Notify only after 3 minutes of consecutive failures.
+            first_fail_at = float(state[name]["first_fail_at"] or 0)
+            if (now - first_fail_at) < FAIL_DURATION_SECONDS:
+                continue
 
+            state[name]["down"] = True
+            msg = f"[{ts()}] 【系統監控】偵測到 {name} 可能已停止（連續 {int(now - first_fail_at)} 秒無回應）：{err}。"
+            notify(scope, msg, features, costco_api, cruise_api)
         time.sleep(CHECK_INTERVAL_SECONDS)
 
 

@@ -16,3 +16,4 @@ state/
 users_cruise.*
 monitors_cruise.json
 __pycache__/
+.venv/
