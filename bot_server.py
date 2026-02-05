@@ -407,7 +407,7 @@ def cruise_pay(code: str):
         if not access_token:
             return jsonify({"ok": False, "error": "missing access token"}), 401
         try:
-            r = requests.post(url, headers=_cruise_payment_headers(access_token), json=body, timeout=20)
+            r = request_cruise("POST", url, access_token=access_token, headers_type="payment", json=body)
             status = r.status_code
             print(
                 f"[{ts()}] [CRUISE] payment attempt={attempt} status={status}",
@@ -986,7 +986,7 @@ def refresh_access_token(reason: str) -> tuple[bool, str]:
     payload = {"refreshToken": refresh_token}
     headers = {"Content-Type": "application/json"}
     try:
-        r = requests.post(url, headers=headers, json=payload, timeout=20)
+        r = request_cruise("POST", url, headers=headers, json=payload)
     except Exception as ex:
         body_head = str(ex)[:200]
         print(
@@ -1103,10 +1103,61 @@ def _cruise_headers(access_token: str) -> dict:
     }
 
 
+def _resolve_cruise_headers(access_token: str | None, headers_type: str | None) -> dict:
+    if headers_type == "payment":
+        return _cruise_payment_headers(access_token) if access_token else {}
+    if headers_type == "basic":
+        return _cruise_headers(access_token) if access_token else {}
+    if headers_type in (None, "", "none"):
+        return {}
+    return {}
+
+
+def request_cruise(
+    method: str,
+    url: str,
+    *,
+    access_token: str | None = None,
+    headers_type: str | None = "payment",
+    headers: dict | None = None,
+    timeout: int | float = 20,
+    retries: int = 1,
+    retry_statuses: tuple[int, ...] = (502, 503, 504),
+    **kwargs,
+) -> requests.Response:
+    req_headers = headers if headers is not None else _resolve_cruise_headers(access_token, headers_type)
+    attempts = max(1, int(retries or 1))
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = requests.request(method, url, headers=req_headers, timeout=timeout, **kwargs)
+        except requests.RequestException as ex:
+            last_exc = ex
+            if attempt < attempts:
+                print(
+                    f"[{ts()}] [CRUISE] request retrying method={method} url={url} "
+                    f"error={type(ex).__name__} attempt={attempt}/{attempts}",
+                    flush=True,
+                )
+                continue
+            raise
+        if retry_statuses and resp.status_code in retry_statuses and attempt < attempts:
+            print(
+                f"[{ts()}] [CRUISE] request retrying method={method} url={url} "
+                f"status={resp.status_code} attempt={attempt}/{attempts}",
+                flush=True,
+            )
+            continue
+        return resp
+    if last_exc:
+        raise last_exc
+    return resp
+
+
 def fetch_booking_summary(access_token: str, booking_id_numeric: int) -> dict | None:
     customers_url = f"{CRUISE_BACKEND_BASE}/customers/booking/{booking_id_numeric}"
     try:
-        r = requests.get(customers_url, headers=_cruise_headers(access_token), timeout=20)
+        r = request_cruise("GET", customers_url, access_token=access_token, headers_type="basic")
         if r.status_code == 200:
             try:
                 payload = r.json() or {}
@@ -1135,7 +1186,7 @@ def fetch_booking_summary(access_token: str, booking_id_numeric: int) -> dict | 
 
     url = f"{CRUISE_BACKEND_BASE}/booking/{booking_id_numeric}"
     try:
-        r = requests.get(url, headers=_cruise_headers(access_token), timeout=20)
+        r = request_cruise("GET", url, access_token=access_token, headers_type="basic")
         r.raise_for_status()
         payload = r.json() or {}
         if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
@@ -1704,7 +1755,7 @@ def _book_and_paylink_flow(data: dict, base_url: str, trace_id: str) -> tuple[di
     for attempt in range(2):
         draft_url = f"{CRUISE_BACKEND_BASE}/customers/v2/booking/draft"
         try:
-            r = requests.post(draft_url, headers=headers, json=draft_payload, timeout=20)
+            r = request_cruise("POST", draft_url, headers=headers, json=draft_payload)
         except Exception as ex:
             print(f"[{ts()}] [CRUISE] trace={trace_id} draft error={type(ex).__name__}", flush=True)
             return {"ok": False, "error": "後端建立草稿失敗，請稍後重試"}, 502
@@ -1722,7 +1773,7 @@ def _book_and_paylink_flow(data: dict, base_url: str, trace_id: str) -> tuple[di
 
         check_url = f"{CRUISE_BACKEND_BASE}/booking/check-status/{booking_id}"
         try:
-            r = requests.get(check_url, headers=headers, timeout=20)
+            r = request_cruise("GET", check_url, headers=headers)
         except Exception as ex:
             print(f"[{ts()}] [CRUISE] trace={trace_id} check-status error={type(ex).__name__}", flush=True)
             return {"ok": False, "error": "後端查詢訂單狀態失敗，請稍後重試"}, 502
@@ -1744,7 +1795,7 @@ def _book_and_paylink_flow(data: dict, base_url: str, trace_id: str) -> tuple[di
 
         booking_url = f"{CRUISE_BACKEND_BASE}/booking/{numeric_id}"
         try:
-            r = requests.get(booking_url, headers=headers, timeout=20)
+            r = request_cruise("GET", booking_url, headers=headers)
         except Exception as ex:
             print(f"[{ts()}] [CRUISE] trace={trace_id} booking error={type(ex).__name__}", flush=True)
             return {"ok": False, "error": "後端查詢訂單詳情失敗，請稍後重試"}, 502
@@ -1880,7 +1931,7 @@ def _match_alias(token: str, entries: list) -> dict | None:
 
 def _fetch_fc_list(access_token: str) -> tuple[list, str | None]:
     url = f"{CRUISE_BACKEND_BASE}/frequent-cruisers-customer"
-    r = requests.get(url, headers=_cruise_payment_headers(access_token), timeout=20)
+    r = request_cruise("GET", url, access_token=access_token, headers_type="payment")
     if r.status_code == 401:
         raise PermissionError("fc unauthorized")
     r.raise_for_status()
@@ -2079,7 +2130,7 @@ def _validate_mmid(
         "id": booking_id,
         "recordUpdatedTime": record_updated_time,
     }
-    r = requests.post(url, headers=_cruise_payment_headers(access_token), json=payload, timeout=20)
+    r = request_cruise("POST", url, access_token=access_token, headers_type="payment", json=payload)
     if r.status_code == 401:
         return False, "Token 已過期，請重新登入 SDC 後再試"
     if r.status_code >= 400:
@@ -2160,11 +2211,12 @@ def _resolve_allotment(access_token: str, date: str, tier: int, pax: int) -> tup
         "lang": "hant",
     }
     try:
-        r = requests.get(
+        r = request_cruise(
+            "GET",
             f"{CRUISE_BACKEND_BASE}/customers/cabin-allotment",
+            access_token=access_token,
+            headers_type="payment",
             params=params,
-            headers=_cruise_payment_headers(access_token),
-            timeout=20,
         )
     except Exception:
         return None, "查詢房型失敗，請稍後再試"
@@ -2756,7 +2808,7 @@ def _book_and_paylink_with_people(
     headers = _cruise_payment_headers(access_token)
     draft_url = f"{CRUISE_BACKEND_BASE}/customers/v2/booking/draft"
     try:
-        r = requests.post(draft_url, headers=headers, json=draft_payload, timeout=20)
+        r = request_cruise("POST", draft_url, headers=headers, json=draft_payload)
     except Exception as ex:
         print(f"[{ts()}] [CRUISE] trace={trace_id} draft error={type(ex).__name__}", flush=True)
         return {"ok": False, "error": "建立草稿失敗，請稍後重試"}, 502
@@ -2782,7 +2834,7 @@ def _book_and_paylink_with_people(
         return {"ok": False, "error": "後端回傳缺少 booking_id"}, 502
 
     check_url = f"{CRUISE_BACKEND_BASE}/booking/check-status/{booking_id}"
-    r = requests.get(check_url, headers=headers, timeout=20)
+    r = request_cruise("GET", check_url, headers=headers)
     if _handle_unauthorized(r.status_code, "check-status", f"status={r.status_code}", include_403=False, notify_mode="action_fail"):
         _log_backend_response(trace_id, "check-status", r)
         return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
@@ -2797,7 +2849,7 @@ def _book_and_paylink_with_people(
         return {"ok": False, "error": "無法取得 numeric_id"}, 502
 
     booking_url = f"{CRUISE_BACKEND_BASE}/booking/{numeric_id}"
-    r = requests.get(booking_url, headers=headers, timeout=20)
+    r = request_cruise("GET", booking_url, headers=headers)
     if _handle_unauthorized(r.status_code, "booking", f"status={r.status_code}", include_403=False, notify_mode="action_fail"):
         _log_backend_response(trace_id, "booking", r)
         return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
@@ -2812,7 +2864,7 @@ def _book_and_paylink_with_people(
 
     latest_record_updated_time = _extract_record_updated_time(booking_summary, record_updated_time)
     if not latest_record_updated_time:
-        r = requests.get(booking_url, headers=headers, timeout=20)
+        r = request_cruise("GET", booking_url, headers=headers)
         if _handle_unauthorized(r.status_code, "booking-refresh", f"status={r.status_code}", include_403=False, notify_mode="action_fail"):
             _log_backend_response(trace_id, "booking-refresh", r)
             return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
@@ -2844,7 +2896,7 @@ def _book_and_paylink_with_people(
     )
 
     update_url = f"{CRUISE_BACKEND_BASE}/customers/v2/booking"
-    r = requests.post(update_url, headers=headers, json=booking_payload, timeout=20)
+    r = request_cruise("POST", update_url, headers=headers, json=booking_payload)
     if _handle_unauthorized(r.status_code, "booking-update", f"status={r.status_code}", include_403=False, notify_mode="action_fail"):
         _log_backend_response(trace_id, "booking-update", r)
         return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
@@ -2852,7 +2904,7 @@ def _book_and_paylink_with_people(
         _log_backend_response(trace_id, "booking-update", r)
         return {"ok": False, "error": "更新乘客資料失敗"}, 502
 
-    r = requests.get(booking_url, headers=headers, timeout=20)
+    r = request_cruise("GET", booking_url, headers=headers)
     if _handle_unauthorized(r.status_code, "booking-refresh", f"status={r.status_code}", include_403=False, notify_mode="action_fail"):
         _log_backend_response(trace_id, "booking-refresh", r)
         return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
@@ -2864,7 +2916,7 @@ def _book_and_paylink_with_people(
         booking_summary = booking_payload if isinstance(booking_payload, dict) else {}
     latest_record_updated_time = _extract_record_updated_time(booking_summary, latest_record_updated_time)
     if not latest_record_updated_time:
-        r = requests.get(booking_url, headers=headers, timeout=20)
+        r = request_cruise("GET", booking_url, headers=headers)
         if _handle_unauthorized(r.status_code, "booking-refresh", f"status={r.status_code}", include_403=False, notify_mode="action_fail"):
             _log_backend_response(trace_id, "booking-refresh", r)
             return {"ok": False, "error": "Token 已過期，請重新登入 SDC 後再試"}, 401
@@ -2909,7 +2961,7 @@ def _book_and_paylink_with_people(
 def fetch_itinerary(access_token: str, date: str) -> str | None:
     url = f"{CRUISE_BACKEND_BASE}/customers/list/itinerary"
     params = {"departure_date": date, "lang": "hant", "page": 1}
-    r = requests.get(url, params=params, headers=_cruise_headers(access_token), timeout=10)
+    r = request_cruise("GET", url, access_token=access_token, headers_type="basic", params=params)
     if _handle_unauthorized(r.status_code, "fetch_itinerary", f"status={r.status_code}", notify_mode="action_fail"):
         return None
     r.raise_for_status()
@@ -2924,7 +2976,7 @@ def fetch_itinerary(access_token: str, date: str) -> str | None:
 def fetch_port(access_token: str, date: str) -> dict | None:
     url = f"{CRUISE_BACKEND_BASE}/customers/list/port"
     params = {"departure_date": date, "lang": "hant", "page": 1}
-    r = requests.get(url, params=params, headers=_cruise_headers(access_token), timeout=10)
+    r = request_cruise("GET", url, access_token=access_token, headers_type="basic", params=params)
     if _handle_unauthorized(r.status_code, "fetch_port", f"status={r.status_code}", notify_mode="action_fail"):
         return None
     r.raise_for_status()
@@ -3370,7 +3422,7 @@ def handle_cruise_message(event):
             return
         url = f"{CRUISE_BACKEND_BASE}/frequent-cruisers-customer"
         try:
-            r = requests.get(url, headers=_cruise_payment_headers(access), timeout=20)
+            r = request_cruise("GET", url, access_token=access, headers_type="payment")
         except Exception as ex:
             reply = f"查詢親友名單失敗：{type(ex).__name__}"
             cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
