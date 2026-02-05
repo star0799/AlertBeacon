@@ -400,6 +400,7 @@ def cruise_pay(code: str):
 
     last_status = None
     last_detail = None
+    last_detail_text = ""
     last_error = None
 
     for attempt in (1, 2):
@@ -439,15 +440,11 @@ def cruise_pay(code: str):
                     detail = body_head
             last_status = status
             last_detail = detail
-            if _is_unauthorized_status(status) and attempt == 1:
-                ok, err = refresh_access_token("payment")
-                if not ok:
-                    print(
-                        f"[{ts()}] [CRUISE] payment refresh failed err={err}",
-                        flush=True,
-                    )
-                if ok:
-                    continue
+            if _is_unauthorized_status(status):
+                last_detail_text = f"status={status}"
+                if body_head:
+                    last_detail_text = f"{last_detail_text} body={body_head[:200]}"
+                break
             print(
                 f"[{ts()}] [CRUISE] payment failed: attempt={attempt} status={status} body_head={body_head}",
                 flush=True,
@@ -458,7 +455,7 @@ def cruise_pay(code: str):
             last_error = ex
             break
 
-    _handle_unauthorized(last_status, "payment", f"status={last_status}", notify_mode="action_fail")
+    _handle_unauthorized(last_status, "payment", last_detail_text or f"status={last_status}", notify_mode="action_fail")
     if last_status is not None:
         return jsonify({"ok": False, "error": f"payment api failed ({last_status})", "detail": last_detail}), 502
     return jsonify({"ok": False, "error": f"payment api failed", "detail": str(last_error)}), 502
@@ -841,7 +838,7 @@ def _action_label(action: str) -> str:
 
 def _unauthorized_error(action: str) -> str:
     label = _action_label(action)
-    return f"{label}操作失敗（未授權）"
+    return f"{label}操作失敗"
 
 
 def _notify_cruise_action_failed(action: str, detail: str = "") -> None:
