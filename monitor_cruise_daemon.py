@@ -261,7 +261,8 @@ def main():
     print(f"[{ts()}] [DAEMON] started. polling every {POLL_SECONDS} seconds", flush=True)
     paused = False
 
-    last_alert_at = 0.0
+    relogin_notified = False
+    error_notified = False
     tier_rules = load_tier_rules()
 
     while True:
@@ -419,6 +420,8 @@ def main():
                     })
                     print(f"[{ts()}] [DAEMON] monitor error key={monitor_key}:", repr(ex), flush=True)
                     continue
+            relogin_notified = False
+            error_notified = False
             sleep_with_feature_checks(POLL_SECONDS)
 
         except Exception as e:
@@ -426,37 +429,51 @@ def main():
             now = time.time()
 
             if isinstance(e, PermissionError):
-                if now - last_alert_at > 300:
+                err_text = str(e) or ""
+                if "refresh unauthorized" in err_text.lower():
+                    if not relogin_notified:
+                        try:
+                            notify({
+                                "type": "CRUISE_NEED_RELOGIN",
+                                "at": now,
+                                "message": "Cruise 需要重新登入一次（refresh 失效/未授權）。請開啟 SDC 登入頁手動登入，Token Sync 會自動回灌。",
+                                "error": err_text,
+                            })
+                        except Exception as ex:
+                            print(f"[{ts()}] [DAEMON] notify failed:", repr(ex), flush=True)
+                        relogin_notified = True
                     try:
-                        notify({
-                            "type": "CRUISE_NEED_RELOGIN",
-                            "at": now,
-                            "message": "Cruise token expired/unauthorized. Please open SDC login page and login once to resync tokens.",
-                            "error": str(e),
-                        })
+                        requests.post(f"{BOT}/cruise/tokens/clear", timeout=5)
+                        print(f"[{ts()}] [DAEMON] tokens cleared on bot_server", flush=True)
                     except Exception as ex:
-                        print(f"[{ts()}] [DAEMON] notify failed:", repr(ex), flush=True)
-                    last_alert_at = now
-
-                try:
-                    requests.post(f"{BOT}/cruise/tokens/clear", timeout=5)
-                    print(f"[{ts()}] [DAEMON] tokens cleared on bot_server", flush=True)
-                except Exception as ex:
-                    print(f"[{ts()}] [DAEMON] warn: failed to clear tokens:", repr(ex), flush=True)
+                        print(f"[{ts()}] [DAEMON] warn: failed to clear tokens:", repr(ex), flush=True)
+                else:
+                    if not error_notified:
+                        try:
+                            notify({
+                                "type": "CRUISE_DAEMON_ERROR",
+                                "at": now,
+                                "message": "Cruise 監控遇到未授權或後端異常，將持續重試。",
+                                "error": err_text,
+                            })
+                        except Exception as ex:
+                            print(f"[{ts()}] [DAEMON] notify failed:", repr(ex), flush=True)
+                        error_notified = True
 
                 sleep_with_feature_checks(60)
                 continue
 
-            if now - last_alert_at > 600:
+            if not error_notified:
                 try:
                     notify({
                         "type": "CRUISE_DAEMON_ERROR",
                         "at": now,
+                        "message": "Cruise 監控發生錯誤，將持續重試。",
                         "error": str(e),
                     })
                 except Exception as ex:
                     print(f"[{ts()}] [DAEMON] notify failed:", repr(ex), flush=True)
-                last_alert_at = now
+                error_notified = True
 
             sleep_with_feature_checks(10)
 
