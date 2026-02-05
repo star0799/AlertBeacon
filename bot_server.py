@@ -2381,7 +2381,7 @@ def _prepare_passengers_from_private(names: list[str]) -> tuple[dict | None, lis
     people, emergencies = _load_private_people()
     errors = []
 
-    def build_passenger(token: str, label: str) -> dict | None:
+    def _build_private_passenger(token: str, label: str) -> dict | None:
         entry = _match_alias(token, people)
         if not entry:
             errors.append(f"找不到{label}資料：{label}({token})")
@@ -2411,10 +2411,10 @@ def _prepare_passengers_from_private(names: list[str]) -> tuple[dict | None, lis
             return None
         return base
 
-    main = build_passenger(names[0], "主乘客", True)
+    main = _build_private_passenger(names[0], "主乘客", True)
     companions = []
     for idx, token in enumerate(names[1:-1], 1):
-        p = build_passenger(token, f"同行{idx}", False)
+        p = _build_private_passenger(token, f"同行{idx}", False)
         if p:
             companions.append(p)
 
@@ -2676,7 +2676,7 @@ def _resolve_passengers_and_emergency(
     companion_tokens = names[1:-1]
     emergency_token = names[-1]
 
-    def build_passenger(token: str, label: str, is_main: bool) -> tuple[dict | None, str | None]:
+    def _build_resolved_passenger(token: str, label: str, is_main: bool) -> tuple[dict | None, str | None]:
         entry = _match_alias(token, people)
         if not entry:
             return None, f"找不到{label}資料，請在 private_people.json 補 alias"
@@ -2775,13 +2775,13 @@ def _resolve_passengers_and_emergency(
             return None, "缺少必填欄位：" + ", ".join(missing)
         return base, None
 
-    main_passenger, err = build_passenger(main_token, "主乘客", True)
+    main_passenger, err = _build_resolved_passenger(main_token, "主乘客", True)
     if err:
         return None, None, None, err
 
     companions = []
     for idx, token in enumerate(companion_tokens, 1):
-        passenger, err = build_passenger(token, f"同行{idx}", False)
+        passenger, err = _build_resolved_passenger(token, f"同行{idx}", False)
         if err:
             return None, None, None, err
         companions.append(passenger)
@@ -3240,7 +3240,7 @@ def handle_costco_message(event):
                 )
 
             # 合併寫回（短時間持有 lock，不做網路 I/O）
-            def mut(monitors_list):
+            def _apply_status_updates(monitors_list):
                 for m in monitors_list:
                     url = m["url"]
                     if url in status_updates:
@@ -3248,7 +3248,7 @@ def handle_costco_message(event):
                     # 每次更新完順便重算 alive
                     m["alive"] = calc_alive(m, now)
 
-            update_monitors(mut)
+            update_monitors(_apply_status_updates)
             reply = "\n".join(lines)
 
         costco_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
@@ -3276,7 +3276,7 @@ def handle_costco_message(event):
 
         result = {"added": False, "duplicate": False}
 
-        def mut(monitors_list):
+        def _add_stock_monitor(monitors_list):
             # 檢查是否已存在
             if any(m["url"] == url for m in monitors_list):
                 result["duplicate"] = True
@@ -3295,7 +3295,7 @@ def handle_costco_message(event):
             )
             result["added"] = True
 
-        update_monitors(mut)
+        update_monitors(_add_stock_monitor)
 
         if result["duplicate"]:
             reply = "❗ 此 URL 已在監控列表中。"
@@ -3324,13 +3324,13 @@ def handle_costco_message(event):
         url = parts[1]
         result = {"removed": False}
 
-        def mut(monitors_list):
+        def _remove_stock_monitor(monitors_list):
             before = len(monitors_list)
             monitors_list[:] = [m for m in monitors_list if m["url"] != url]
             if len(monitors_list) < before:
                 result["removed"] = True
 
-        update_monitors(mut)
+        update_monitors(_remove_stock_monitor)
 
         if result["removed"]:
             reply = f"🗑 已移除監控：\n{url}"
@@ -3693,13 +3693,13 @@ def handle_cruise_message(event):
             return
         result = {"removed": False}
 
-        def mut(monitors_list):
+        def _remove_cruise_monitor(monitors_list):
             before = len(monitors_list)
             monitors_list[:] = [m for m in monitors_list if m.get("date") != date]
             if len(monitors_list) < before:
                 result["removed"] = True
 
-        update_cruise_monitors(mut)
+        update_cruise_monitors(_remove_cruise_monitor)
 
         if result["removed"]:
             reply = f"✅ 已刪除監控：{date}"
@@ -3775,7 +3775,7 @@ def handle_cruise_message(event):
 
     result = {"updated": False, "added": False}
 
-    def mut(monitors_list):
+    def _upsert_cruise_monitor(monitors_list):
         for m in monitors_list:
             if m.get("date") == date:
                 m["lang"] = "hant"
@@ -3811,7 +3811,7 @@ def handle_cruise_message(event):
         })
         result["added"] = True
 
-    update_cruise_monitors(mut)
+    update_cruise_monitors(_upsert_cruise_monitor)
 
     status = "✅ 已更新監控" if result["updated"] else "✅ 已新增監控"
     reply = (
