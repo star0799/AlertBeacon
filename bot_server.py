@@ -169,7 +169,7 @@ def cruise_pay(code: str):
     with lock:
         links = read_json(PAY_LINKS_FILE, {})
         if not isinstance(links, dict) or code not in links:
-            resp = jsonify({"ok": False, "error": "此連結已經使用過，請重新下單"})
+            resp = jsonify({"ok": False, "error": "此付款連結不存在或已失效（可能已過期、已被清除或在不同環境產生），請重新下單"})
             resp.headers["Content-Type"] = "application/json; charset=utf-8"
             return resp, 410
 
@@ -198,7 +198,7 @@ def cruise_pay(code: str):
 
         entry = links.get(code)
         if not isinstance(entry, dict):
-            resp = jsonify({"ok": False, "error": "此連結已經使用過，請重新下單"})
+            resp = jsonify({"ok": False, "error": "此付款連結不存在或已失效（可能已過期、已被清除或在不同環境產生），請重新下單"})
             resp.headers["Content-Type"] = "application/json; charset=utf-8"
             return resp, 410
 
