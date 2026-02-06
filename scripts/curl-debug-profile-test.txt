@@ -1,0 +1,3 @@
+$key = "U7f123456"
+$uid = "U2bdef371cebb57a77f945e89188f5639"
+curl.exe -sS -H "X-CRUISE-ADMIN-KEY: $key" "http://127.0.0.1:5000/cruise/debug/profile/$uid"
