@@ -1,6 +1,6 @@
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
+from linebot.exceptions import InvalidSignatureError, LineBotApiError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from flask import Flask, request, jsonify
 import html
@@ -609,6 +609,67 @@ def cruise_command():
     if error_type == "upstream_error":
         return jsonify(result), 502
     return jsonify(result), 500
+
+
+@app.get("/cruise/debug/profile/<user_id>")
+def cruise_debug_profile(user_id: str):
+    """Debug helper: verify current Cruise channel token can access this user profile."""
+    admin_key = CRUISE_ADMIN_KEY or ""
+    if not admin_key:
+        return jsonify({"ok": False, "error": "API_DISABLED", "message": "debug API disabled"}), 503
+    provided_key = request.headers.get("X-CRUISE-ADMIN-KEY")
+    if not provided_key or provided_key != admin_key:
+        return jsonify({"ok": False, "error": "UNAUTHORIZED", "message": "invalid admin key"}), 401
+
+    user_id = (user_id or "").strip()
+    if not user_id:
+        return jsonify({"ok": False, "error": "BAD_REQUEST", "message": "missing user_id"}), 400
+
+    try:
+        bot = cruise_line_bot_api.get_bot_info(timeout=10)
+        bot_info = bot.as_json_dict() if hasattr(bot, "as_json_dict") else {}
+    except LineBotApiError as e:
+        payload = {
+            "ok": False,
+            "stage": "get_bot_info",
+            "line_status": getattr(e, "status_code", None),
+            "request_id": getattr(e, "request_id", None),
+            "accepted_request_id": getattr(e, "accepted_request_id", None),
+            "error_response": getattr(getattr(e, "error", None), "as_json_dict", lambda: None)(),
+        }
+        return jsonify(payload), 502
+    except Exception as e:
+        return jsonify({"ok": False, "stage": "get_bot_info", "error": f"{type(e).__name__}: {e}"}), 502
+
+    try:
+        profile = cruise_line_bot_api.get_profile(user_id, timeout=10)
+        profile_dict = profile.as_json_dict() if hasattr(profile, "as_json_dict") else {}
+        return jsonify({"ok": True, "bot": bot_info, "profile": profile_dict}), 200
+    except LineBotApiError as e:
+        hint = (
+            "常見原因：此 userId 不屬於此頻道、使用者未加此測試 Bot 為好友/已封鎖、"
+            "或你拿到的是群組/房間情境下不支援查詢的 userId。"
+        )
+        payload = {
+            "ok": False,
+            "stage": "get_profile",
+            "user_id": user_id,
+            "bot": bot_info,
+            "line_status": getattr(e, "status_code", None),
+            "request_id": getattr(e, "request_id", None),
+            "accepted_request_id": getattr(e, "accepted_request_id", None),
+            "error_response": getattr(getattr(e, "error", None), "as_json_dict", lambda: None)(),
+            "hint": hint,
+        }
+        return jsonify(payload), 502
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "stage": "get_profile",
+            "user_id": user_id,
+            "bot": bot_info,
+            "error": f"{type(e).__name__}: {e}",
+        }), 502
 
 
 @app.post("/cruise/paylink/notify")

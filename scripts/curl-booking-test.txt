@@ -1,0 +1,11 @@
+$k = "U7f123456"
+
+$body = '{"line_user_id":"U2bdef371cebb57a77f945e89188f5639","text":"訂房 2026/02/22 海景 李登貴 李岳倫","reply":false}'
+
+$tmp = Join-Path $env:TEMP "cruise_cmd.json"
+[System.IO.File]::WriteAllText($tmp, $body, (New-Object System.Text.UTF8Encoding($false)))
+
+curl.exe -s -D - -X POST "http://127.0.0.1:5000/cruise/command" `
+  -H "Content-Type: application/json; charset=utf-8" `
+  -H "X-CRUISE-ADMIN-KEY: $k" `
+  --data-binary "@$tmp"
