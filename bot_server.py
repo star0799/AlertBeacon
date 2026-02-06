@@ -735,6 +735,15 @@ def cruise_notify():
             f"{err}"
         )
 
+    elif t == "CRUISE_REFRESH_TEMP_FAILED":
+        err = data.get("error") or ""
+        text = "⚠️ 刷新 Token 暫時失敗，將持續重試"
+        if err:
+            text += f"\n{err}"
+
+    elif t == "CRUISE_TOKEN_RECOVERED":
+        text = "✅ Cruise Token 已恢復，監控已恢復"
+
     else:
         # 其他事件先直接丟 type + error/message
         msg = data.get("message") or data.get("error") or ""

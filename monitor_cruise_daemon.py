@@ -61,6 +61,26 @@ def refresh(refresh_token: str) -> dict:
     return r.json()
 
 
+class RefreshTempFailed(Exception):
+    """Refresh failed (non-401/403) after retry; treat as transient and do not clear tokens."""
+
+
+def _body_head(text: str, limit: int = 200) -> str:
+    return (text or "")[:limit].replace("\n", " ").replace("\r", " ")
+
+
+def _refresh_error_text(ex: Exception) -> str:
+    if isinstance(ex, PermissionError):
+        return str(ex) or "refresh unauthorized"
+    if isinstance(ex, requests.HTTPError):
+        sc = getattr(getattr(ex, "response", None), "status_code", None)
+        body = _body_head(getattr(getattr(ex, "response", None), "text", "") or "")
+        return f"refresh http error status={sc} body={body}"
+    if isinstance(ex, requests.RequestException):
+        return f"refresh request error {type(ex).__name__}: {str(ex)[:200]}"
+    return f"refresh error {type(ex).__name__}: {str(ex)[:200]}"
+
+
 def cabin_allotment(access_token: str, params: dict) -> tuple[int, dict]:
     r = requests.get(
         f"{BASE}/customers/cabin-allotment",
@@ -249,13 +269,31 @@ def fetch_cabins(access: str, refresh_token: str, params: dict, user: str | None
         status_code, data = cabin_allotment(access, params)
         return status_code, data, access, refresh_token
     except PermissionError:
-        try:
-            ref = refresh(refresh_token)
-        except requests.HTTPError as ex:
-            sc = getattr(ex.response, "status_code", None)
-            if sc in (401, 403):
-                raise PermissionError(f"refresh unauthorized {sc}") from ex
-            raise
+        ref = None
+        last_err: Exception | None = None
+
+        for attempt in (1, 2):
+            try:
+                ref = refresh(refresh_token)
+                last_err = None
+                break
+            except Exception as ex:
+                last_err = ex
+
+            if attempt == 1:
+                # After a first refresh failure, wait a bit then retry once.
+                sleep_with_feature_checks(30)
+                # Token may have been synced/updated while we were waiting.
+                latest = get_tokens()
+                if latest:
+                    access = latest.get("accessToken") or access
+                    refresh_token = latest.get("refreshToken") or refresh_token
+                    user = latest.get("user") or user
+
+        if ref is None:
+            if isinstance(last_err, PermissionError):
+                raise last_err
+            raise RefreshTempFailed(_refresh_error_text(last_err or Exception("unknown refresh error")))
 
         new_access = ref.get("accessToken")
         new_refresh = ref.get("refreshToken")
@@ -287,6 +325,7 @@ def main():
 
     relogin_notified = False
     error_notified = False
+    refresh_temp_failed = False
     tier_rules = load_tier_rules()
 
     while True:
@@ -304,6 +343,7 @@ def main():
         try:
             tokens = get_tokens()
             if not tokens:
+                refresh_temp_failed = False
                 print(f"[{ts()}] [DAEMON] waiting for tokens... (please login once)", flush=True)
                 sleep_with_feature_checks(30)
                 continue
@@ -312,6 +352,7 @@ def main():
             user = tokens.get("user")
 
             monitors = read_monitors()
+            any_http_200_total = False
             for monitor in monitors:
                 if not monitor.get("enabled", False):
                     continue
@@ -351,6 +392,7 @@ def main():
                         last_http = status_code
                         if status_code == 200:
                             any_http_200 = True
+                            any_http_200_total = True
                         if items:
                             last_items = items
                             any_items = True
@@ -430,6 +472,8 @@ def main():
                     update_monitor_fields(monitor_key, update_fields)
                 except PermissionError:
                     raise
+                except RefreshTempFailed:
+                    raise
                 except requests.HTTPError as ex:
                     code = getattr(ex.response, "status_code", None)
                     update_monitor_fields(monitor_key, {
@@ -445,6 +489,17 @@ def main():
                     })
                     print(f"[{ts()}] [DAEMON] monitor error key={monitor_key}:", repr(ex), flush=True)
                     continue
+
+            if refresh_temp_failed and any_http_200_total:
+                try:
+                    notify({
+                        "type": "CRUISE_TOKEN_RECOVERED",
+                        "at": time.time(),
+                        "message": "Cruise Token 已恢復，監控已恢復",
+                    })
+                except Exception as ex:
+                    print(f"[{ts()}] [DAEMON] notify failed:", repr(ex), flush=True)
+                refresh_temp_failed = False
             relogin_notified = False
             error_notified = False
             sleep_with_feature_checks(POLL_SECONDS)
@@ -453,9 +508,25 @@ def main():
             print(f"[{ts()}] [DAEMON] error:", repr(e), flush=True)
             now = time.time()
 
+            if isinstance(e, RefreshTempFailed):
+                if not refresh_temp_failed:
+                    try:
+                        notify({
+                            "type": "CRUISE_REFRESH_TEMP_FAILED",
+                            "at": now,
+                            "message": "刷新 Token 暫時失敗，將持續重試",
+                            "error": str(e),
+                        })
+                    except Exception as ex:
+                        print(f"[{ts()}] [DAEMON] notify failed:", repr(ex), flush=True)
+                    refresh_temp_failed = True
+                sleep_with_feature_checks(60)
+                continue
+
             if isinstance(e, PermissionError):
                 err_text = str(e) or ""
                 if "refresh unauthorized" in err_text.lower():
+                    refresh_temp_failed = False
                     if not relogin_notified:
                         try:
                             notify({
