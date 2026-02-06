@@ -2187,6 +2187,15 @@ def _normalize_phone_digits(value: str) -> str:
     return re.sub(r"[^\d]", "", value)
 
 
+def _normalize_iso31661_alpha2(value: str | None, lower: bool = True) -> str | None:
+    if not isinstance(value, str):
+        return None
+    v = value.strip()
+    if not re.match(r"^[A-Za-z]{2}$", v):
+        return None
+    return v.lower() if lower else v.upper()
+
+
 def _mask_id(value: str | int | None, keep: int = 5) -> str:
     if value is None:
         return ""
@@ -2388,6 +2397,27 @@ def _build_booking_payload(
     passengers: list,
     emergency_contact: dict,
 ) -> dict:
+    passenger_list = []
+    for idx, p in enumerate(passengers or []):
+        if not isinstance(p, dict):
+            continue
+        item = dict(p)
+        # 官網 passenger_list 的 pax_number：主乘客=1；同行從 2 開始。
+        if not item.get("pax_number"):
+            item["pax_number"] = idx + 2
+
+        # 官網會送出 phone_country_code（ISO3166-1 alpha2，小寫），即使沒有 phone_number。
+        cc = _normalize_iso31661_alpha2(item.get("phone_country_code"), lower=True)
+        if not cc:
+            cc_guess = (
+                (main_passenger or {}).get("phone_country_code")
+                or (main_passenger or {}).get("nationality")
+                or item.get("nationality")
+                or "TW"
+            )
+            cc = _normalize_iso31661_alpha2(cc_guess, lower=True) or "tw"
+        item["phone_country_code"] = cc
+        passenger_list.append(item)
     return {
         "id": numeric_id,
         "cabin_allotment_id": cabin_allotment_id,
@@ -2398,7 +2428,7 @@ def _build_booking_payload(
         "surname": main_passenger.get("last_name"),
         "emergency_contact": emergency_contact,
         "main_passenger": main_passenger,
-        "passenger_list": passengers,
+        "passenger_list": passenger_list,
     }
 
 
@@ -2819,20 +2849,26 @@ def _resolve_passengers_and_emergency(
                 fc_person, err = _find_fc_matches(fc_list_local, token, hints)
                 if err:
                     return None, err
-                fc_id = fc_person.get("id")
+                fc_id_raw = fc_person.get("id")
+                try:
+                    fc_id = int(fc_id_raw)
+                except Exception:
+                    fc_id = None
                 if not fc_id:
                     return None, f"找不到{token}的親友資料，請先加入常用旅客或補 private_people.json"
 
                 base = _map_fc_to_passenger(fc_person)
                 if overrides:
                     base = _merge_dict(base, overrides)
+                base["type"] = "frequent_cruiser"
+                base["fc_id"] = fc_id
 
                 ok, result = _validate_mmid(
                     access_token,
                     numeric_id,
                     latest_record_updated_time,
                     mmid_list=[],
-                    fc_ids=[int(fc_id)],
+                    fc_ids=[fc_id],
                 )
                 if not ok:
                     return None, f"常用旅客驗證失敗：{result}"
