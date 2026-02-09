@@ -1271,6 +1271,8 @@ def fetch_booking_summary(access_token: str, booking_id_numeric: int) -> dict | 
                 f"[{ts()}] [CRUISE] booking summary source=customers/booking booking_id={booking_id_numeric}",
                 flush=True,
             )
+            if isinstance(payload, dict):
+                payload["__booking_summary_source"] = "customers/booking"
             return payload if isinstance(payload, dict) else None
         body_head = ""
         try:
@@ -1294,12 +1296,14 @@ def fetch_booking_summary(access_token: str, booking_id_numeric: int) -> dict | 
         r.raise_for_status()
         payload = r.json() or {}
         if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+            payload["data"]["__booking_summary_source"] = "booking"
             print(
                 f"[{ts()}] [CRUISE] booking summary source=booking booking_id={booking_id_numeric}",
                 flush=True,
             )
             return payload.get("data")
         if isinstance(payload, dict):
+            payload["__booking_summary_source"] = "booking"
             print(
                 f"[{ts()}] [CRUISE] booking summary source=booking booking_id={booking_id_numeric}",
                 flush=True,
@@ -1394,6 +1398,11 @@ def build_paylink_summary_text(
         ])
 
     summary = booking_summary
+    source_tag = ""
+    if summary.get("__booking_summary_source") == "customers/booking":
+        source_tag = "(付款前)"
+    elif summary.get("__booking_summary_source") == "booking":
+        source_tag = "(訂單)"
     order_id = summary.get("id") or booking_id
     departure_date = summary.get("departure_date") or ""
     arrival_date = summary.get("arrival_date") or ""
@@ -1555,7 +1564,7 @@ def build_paylink_summary_text(
     def assemble(max_count: int, include_emergency_details: bool) -> str:
         date_text = departure_date if not arrival_date else f"{departure_date} ～ {arrival_date}"
         lines = [
-            "🧾【付款前二次確認】",
+            f"🧾【付款前二次確認】{source_tag}",
             f"訂單：{_fmt_field(order_id)}",
             f"日期：{_fmt_field(date_text)}",
             f"出發：{_fmt_field(port_name)}",
