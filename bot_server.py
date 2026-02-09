@@ -3390,7 +3390,7 @@ def handle_costco_message(event):
     # 2) 新增監控 / add
     #    新增 URL [秒數]  （秒數省略預設 180）
     # ==================================================
-    if cmd in ("新增", "add"):
+    if cmd in ("新增", "add","新增監控"):
         if len(parts) < 2:
             reply = "格式：\n\n新增 URL [秒數]\nadd URL [秒數]\n\n秒數省略則預設 180 秒。"
             costco_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
@@ -3713,7 +3713,7 @@ def handle_cruise_message(event):
                 "訂房 <日期> <房型> <主乘客> [同行乘客...] <緊急聯絡人> \n"
                 "日期支援：2026-02-22 / 2026/2/22 / 2026.02.22 / 20260222\n"
                 "房型：內側 / 海景 / 露台 / 陽台（露台=陽台）\n"
-                "完整格式如：訂房 2026/02/22 海景房 周惠X 李X樂 李X貴 李X昇\n"
+                "訂房完整格式如：訂房 2026/02/22 海景房 周惠X 李X樂 李X貴 李X昇\n"
             )
             msg = short_error
             if result.get("error_type") == "parse_error":
@@ -3735,7 +3735,7 @@ def handle_cruise_message(event):
         return
 
     list_keywords = ("列出監控", "監控列表", "顯示監控", "列出", "列表","LIST","List","list")
-    delete_keywords = ("刪除", "移除", "取消","DELETE","Delete","delete")
+    delete_keywords = ("刪除", "移除", "取消","DELETE","Delete","delete","DEL","Del","del")
 
     if any(k in raw_text for k in list_keywords):
         monitors = read_cruise_monitors()
@@ -3839,12 +3839,14 @@ def handle_cruise_message(event):
     if not date:
         help_text = (
             "可用指令：\n\n"
-            "列出監控 / 監控列表 / 顯示監控 / 列出 / 列表\n"
-            "刪除/移除/取消 YYYY-MM-DD（也支援 YYYYMMDD / YYYY/MM/DD / YYYY.MM.DD）\n"
+            "列出監控 / 監控列表 / 顯示監控 / 列出 / 列表 / list \n"
+            "新增監控 YYYY-MM-DD (可帶房型)\n"
+            "刪除/del YYYY-MM-DD\n"
             "緊急聯絡人 / 親友名單\n"
-            "功能開關：啟用 / 停用\n"
             "YYYY-MM-DD [內側/海景/露台]\n"
-            "例如：2026-02-27 海景"
+            "例如：2026-02-27 海景\n"
+            "訂房完整格式如：訂房 2026/02/22 海景房 周惠X 李X樂 李X貴 李X昇\n"
+            "全部指令日期支援 YYYY-MM-DD / YYYYMMDD / YYYY/MM/DD / YYYY.MM.DD\n"
         )
         cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=help_text))
         return
