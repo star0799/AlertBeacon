@@ -3841,10 +3841,9 @@ def handle_cruise_message(event):
             "可用指令：\n\n"
             "列出監控 / 監控列表 / 顯示監控 / 列出 / 列表 / list \n"
             "新增監控 YYYY-MM-DD (可帶房型)\n"
+            "例如：2026-02-27 海景\n"
             "刪除/del YYYY-MM-DD\n"
             "緊急聯絡人 / 親友名單\n"
-            "YYYY-MM-DD [內側/海景/露台]\n"
-            "例如：2026-02-27 海景\n"
             "訂房完整格式如：訂房 2026/02/22 海景房 周惠X 李X樂 李X貴 李X昇\n"
             "全部指令日期支援 YYYY-MM-DD / YYYYMMDD / YYYY/MM/DD / YYYY.MM.DD\n"
         )
