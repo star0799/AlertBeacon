@@ -256,11 +256,11 @@ def build_params(monitor: dict, pax: int) -> dict | None:
 
 def build_tier_text(tier: int) -> tuple[str, str]:
     tier_text_map = {
-        3: ("\u9732\u53f0", "\u9732\u53f0\u5ba2\u623f"),
-        2: ("\u6d77\u666f", "\u6d77\u666f\u5ba2\u623f"),
-        1: ("\u5167\u5074", "\u5167\u5074\u5ba2\u623f"),
+        3: ("露台", "露台客房"),
+        2: ("海景", "海景客房"),
+        1: ("內側", "內側客房"),
     }
-    short_text, full_text = tier_text_map.get(tier, (str(tier), f"{tier}\u5ba2\u623f"))
+    short_text, full_text = tier_text_map.get(tier, (str(tier), f"{tier}客房"))
     return short_text, full_text
 
 

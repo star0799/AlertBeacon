@@ -114,7 +114,7 @@ def read_features():
         with lock:
             data = read_json(FEATURES_FILE, defaults)
     except Exception as e:
-        log("\u26a0\ufe0f \u8b80\u53d6 {} \u5931\u6557\uff1a{}: {}".format(FEATURES_FILE, type(e).__name__, e))
+        log("警告 讀取 {} 失敗：{}: {}".format(FEATURES_FILE, type(e).__name__, e))
         return defaults
     if not isinstance(data, dict):
         return defaults
@@ -222,12 +222,12 @@ def main():
         if not feature_enabled("costco"):
             write_heartbeat("paused")
             if not paused:
-                log(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] \u23f8\ufe0f Costco \u76e3\u63a7\u5df2\u505c\u7528\uff0c\u66ab\u505c\u6aa2\u67e5\u4e2d")
+                log(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] Costco 監控已停用，暫停檢查中")
                 paused = True
             time.sleep(FEATURE_CHECK_SECONDS)
             continue
         if paused:
-            log(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] \u2705 Costco \u76e3\u63a7\u5df2\u555f\u7528\uff0c\u6062\u5fa9\u6aa2\u67e5")
+            log(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] Costco 監控已啟用，恢復檢查")
             paused = False
 
         write_heartbeat("running")
