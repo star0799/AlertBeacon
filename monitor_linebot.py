@@ -137,7 +137,7 @@ def push_all(text: str):
 
     for u in users:
         try:
-            line_bot_api.push_message(u, TextSendMessage(text=text))
+            line_bot_api.push_message(u, TextSendMessage(text=text), timeout=10)
         except Exception as e:
             log(f"❌ 推播給 {u} 失敗：{type(e).__name__}: {e}")
 

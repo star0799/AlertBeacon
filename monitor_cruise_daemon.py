@@ -30,22 +30,35 @@ def notify(payload: dict) -> None:
     r.raise_for_status()
 
 
-def get_tokens() -> dict | None:
+def get_tokens() -> tuple[dict | None, str, str]:
     try:
         r = requests.get(f"{BOT}/cruise/tokens", timeout=5)
         r.raise_for_status()
         data = r.json() or {}
     except Exception as e:
+        err = f"{type(e).__name__}: {e}"
         print(f"[{ts()}] [DAEMON] warn: failed to GET /cruise/tokens:", repr(e), flush=True)
-        return None
+        return None, "fetch_failed", err
 
     access = data.get("accessToken")
     refresh_token = data.get("refreshToken")
 
     if not access or not refresh_token:
-        return None
+        return None, "missing_tokens", ""
 
-    return data
+    return data, "ok", ""
+
+
+def check_bot_server_health() -> tuple[bool, str]:
+    try:
+        r = requests.get(f"{BOT}/health", timeout=3)
+        if r.status_code != 200:
+            return False, f"status={r.status_code} body_head={_body_head(r.text)}"
+        return True, ""
+    except requests.Timeout as e:
+        return False, f"timeout {type(e).__name__}: {e}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {str(e)[:200]}"
 
 
 def refresh(refresh_token: str) -> dict:
@@ -341,10 +354,23 @@ def main():
 
         write_heartbeat("running")
         try:
-            tokens = get_tokens()
-            if not tokens:
+            tokens, token_state, token_err = get_tokens()
+            if token_state != "ok":
                 refresh_temp_failed = False
-                print(f"[{ts()}] [DAEMON] waiting for tokens... (please login once)", flush=True)
+                if token_state == "missing_tokens":
+                    print(f"[{ts()}] [DAEMON] waiting for tokens... (please login once)", flush=True)
+                else:
+                    health_ok, health_err = check_bot_server_health()
+                    if health_ok:
+                        print(
+                            f"[{ts()}] [DAEMON] bot_server health OK; /cruise/tokens unavailable ({token_err})",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"[{ts()}] [DAEMON] bot_server health timeout/unavailable ({health_err})",
+                            flush=True,
+                        )
                 sleep_with_feature_checks(30)
                 continue
             access = tokens["accessToken"]

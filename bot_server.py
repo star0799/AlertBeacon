@@ -40,8 +40,27 @@ def ts() -> str:
 print(f"[{ts()}] [BOOT] bot_server file={__file__}", flush=True)
 COSTCO_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_COSTCO_CHANNEL_ACCESS_TOKEN")
 COSTCO_CHANNEL_SECRET = os.getenv("LINE_COSTCO_CHANNEL_SECRET")
+LINE_API_TIMEOUT_SECONDS = 10
 
-costco_line_bot_api = LineBotApi(COSTCO_CHANNEL_ACCESS_TOKEN)
+
+def _bind_line_api_default_timeout(api: LineBotApi, timeout_sec: int = LINE_API_TIMEOUT_SECONDS) -> LineBotApi:
+    push_method = api.push_message
+    reply_method = api.reply_message
+
+    def _push_with_timeout(*args, **kwargs):
+        kwargs.setdefault("timeout", timeout_sec)
+        return push_method(*args, **kwargs)
+
+    def _reply_with_timeout(*args, **kwargs):
+        kwargs.setdefault("timeout", timeout_sec)
+        return reply_method(*args, **kwargs)
+
+    api.push_message = _push_with_timeout
+    api.reply_message = _reply_with_timeout
+    return api
+
+
+costco_line_bot_api = _bind_line_api_default_timeout(LineBotApi(COSTCO_CHANNEL_ACCESS_TOKEN))
 costco_handler = WebhookHandler(COSTCO_CHANNEL_SECRET)
 
 # Cruise
@@ -49,7 +68,7 @@ CRUISE_TOKEN = os.getenv("LINE_CRUISE_CHANNEL_ACCESS_TOKEN")
 CRUISE_SECRET = os.getenv("LINE_CRUISE_CHANNEL_SECRET")
 CRUISE_ADMIN_KEY = os.getenv("CRUISE_ADMIN_KEY")
 
-cruise_line_bot_api = LineBotApi(CRUISE_TOKEN)
+cruise_line_bot_api = _bind_line_api_default_timeout(LineBotApi(CRUISE_TOKEN))
 cruise_handler = WebhookHandler(CRUISE_SECRET)
 
 USERS_FILE = "users.json"

@@ -86,7 +86,7 @@ def _push(line_api: LineBotApi | None, user_ids: list[str], text: str, channel_l
     msg = TextSendMessage(text=text)
     for uid in user_ids:
         try:
-            line_api.push_message(uid, msg)
+            line_api.push_message(uid, msg, timeout=10)
         except Exception as e:
             print(
                 f"[{ts()}] [WATCHDOG] warn: push failed channel={channel_label} uid={uid}: "
