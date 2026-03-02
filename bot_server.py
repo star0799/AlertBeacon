@@ -2004,7 +2004,7 @@ def _book_and_paylink_flow(data: dict, base_url: str, trace_id: str) -> tuple[di
 
 
 def _parse_flexible_date(text: str) -> str | None:
-    m = re.match(r"^(\d{4})[-/\.]?(\d{1,2})[-/\.]?(\d{1,2})$", text)
+    m = re.search(r"(\d{4})[-/\.]?(\d{1,2})[-/\.]?(\d{1,2})", text)
     if not m:
         return None
     y, mo, d = (int(v) for v in m.groups())
