@@ -338,11 +338,11 @@ def fetch_cabins(access: str, refresh_token: str, params: dict, user: str | None
                 # After a first refresh failure, wait a bit then retry once.
                 sleep_with_feature_checks(30)
                 # Token may have been synced/updated while we were waiting.
-                latest = get_tokens()
-                if latest:
-                    access = latest.get("accessToken") or access
-                    refresh_token = latest.get("refreshToken") or refresh_token
-                    user = latest.get("user") or user
+                latest_tokens, latest_state, _ = get_tokens()
+                if latest_state == "ok" and latest_tokens:
+                    access = latest_tokens.get("accessToken") or access
+                    refresh_token = latest_tokens.get("refreshToken") or refresh_token
+                    user = latest_tokens.get("user") or user
 
         if ref is None:
             if isinstance(last_err, PermissionError):
@@ -422,6 +422,7 @@ def main():
             monitors = read_monitors()
             any_http_200_total = False
             for monitor in monitors:
+                write_heartbeat("running", {"phase": "monitor_loop"})
                 if not monitor.get("enabled", False):
                     continue
 
@@ -443,6 +444,7 @@ def main():
                     any_http_200 = False
 
                     for pax in probe_paxes:
+                        write_heartbeat("running", {"phase": "pax_loop"})
                         params = build_params(monitor, pax)
                         if not params:
                             print(f"[{ts()}] [DAEMON] warn: missing required params key={monitor_key}", flush=True)

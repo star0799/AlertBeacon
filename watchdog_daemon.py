@@ -24,6 +24,7 @@ NGROK_TUNNELS_URL = "http://127.0.0.1:4040/api/tunnels"
 CHECK_INTERVAL_SECONDS = 60
 STARTUP_GRACE_SECONDS = 60
 FAIL_DURATION_SECONDS = 180  # notify after 3 minutes of consecutive failures
+ALERT_COOLDOWN_SECONDS = 600  # suppress repeated same-service down alerts within 10 minutes
 HEARTBEAT_STALE_COSTCO_SECONDS = 60
 HEARTBEAT_STALE_CRUISE_SECONDS = 60
 
@@ -173,10 +174,10 @@ def main():
 
     started_at = time.time()
     state = {
-        "bot_server": {"fails": 0, "down": False, "first_fail_at": None},
-        "ngrok": {"fails": 0, "down": False, "first_fail_at": None},
-        "costco": {"fails": 0, "down": False, "first_fail_at": None},
-        "cruise_daemon": {"fails": 0, "down": False, "first_fail_at": None},
+        "bot_server": {"fails": 0, "down": False, "first_fail_at": None, "last_down_alert_at": 0.0},
+        "ngrok": {"fails": 0, "down": False, "first_fail_at": None, "last_down_alert_at": 0.0},
+        "costco": {"fails": 0, "down": False, "first_fail_at": None, "last_down_alert_at": 0.0},
+        "cruise_daemon": {"fails": 0, "down": False, "first_fail_at": None, "last_down_alert_at": 0.0},
     }
 
     print(f"[{ts()}] [WATCHDOG] started. interval={CHECK_INTERVAL_SECONDS}s grace={STARTUP_GRACE_SECONDS}s", flush=True)
@@ -233,7 +234,12 @@ def main():
             if (now - first_fail_at) < FAIL_DURATION_SECONDS:
                 continue
 
+            last_down_alert_at = float(state[name].get("last_down_alert_at") or 0)
+            if (now - last_down_alert_at) < ALERT_COOLDOWN_SECONDS:
+                continue
+
             state[name]["down"] = True
+            state[name]["last_down_alert_at"] = now
             msg = f"[{ts()}] 【系統監控】偵測到 {name} 可能已停止（連續 {int(now - first_fail_at)} 秒無回應）：{err}。"
             notify(scope, msg, features, costco_api, cruise_api, cruise_log_api)
         time.sleep(CHECK_INTERVAL_SECONDS)
