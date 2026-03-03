@@ -110,7 +110,7 @@ def _resolve_cruise_notify_target(event_type: str) -> tuple[LineBotApi | None, s
         return cruise_line_bot_api, USERS_CRUISE_FILE, "cruise"
     if cruise_log_line_bot_api:
         return cruise_log_line_bot_api, USERS_CRUISE_LOG_FILE, "cruise_log"
-    return cruise_line_bot_api, USERS_CRUISE_FILE, "cruise_fallback"
+    return None, USERS_CRUISE_LOG_FILE, "cruise_log_only"
 
 @app.post("/cruise/tokens")
 def cruise_tokens():

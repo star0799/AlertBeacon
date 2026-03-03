@@ -115,7 +115,7 @@ def notify(
         if cruise_log_api:
             _push(cruise_log_api, load_user_ids(USERS_CRUISE_LOG_FILE), text, "cruise_log")
         else:
-            _push(cruise_api, load_user_ids(USERS_CRUISE_FILE), text, "cruise(fallback)")
+            print(f"[{ts()}] [WATCHDOG] warn: cruise_log LINE token not configured; skip cruise alert", flush=True)
 
 
 def _body_head(text: str, limit: int = 200) -> str:
