@@ -12,6 +12,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FEATURES_FILE = os.path.join(BASE_DIR, "features.json")
 USERS_COSTCO_FILE = os.path.join(BASE_DIR, "users.json")
 USERS_CRUISE_FILE = os.path.join(BASE_DIR, "users_cruise.json")
+USERS_CRUISE_LOG_FILE = os.path.join(BASE_DIR, "users_cruise_log.json")
 
 STATE_DIR = os.path.join(BASE_DIR, "state")
 HEARTBEAT_COSTCO_FILE = os.path.join(STATE_DIR, "heartbeat_costco.json")
@@ -95,7 +96,14 @@ def _push(line_api: LineBotApi | None, user_ids: list[str], text: str, channel_l
             )
 
 
-def notify(scope: str, text: str, features: dict, costco_api: LineBotApi | None, cruise_api: LineBotApi | None) -> None:
+def notify(
+    scope: str,
+    text: str,
+    features: dict,
+    costco_api: LineBotApi | None,
+    cruise_api: LineBotApi | None,
+    cruise_log_api: LineBotApi | None,
+) -> None:
     # scope: "costco" | "cruise" | "all"
     allow_costco = bool((features or {}).get("costco", False))
     allow_cruise = bool((features or {}).get("cruise_daemon", False))
@@ -103,7 +111,10 @@ def notify(scope: str, text: str, features: dict, costco_api: LineBotApi | None,
     if allow_costco and scope in ("costco", "all"):
         _push(costco_api, load_user_ids(USERS_COSTCO_FILE), text, "costco")
     if allow_cruise and scope in ("cruise", "all"):
-        _push(cruise_api, load_user_ids(USERS_CRUISE_FILE), text, "cruise")
+        if cruise_log_api:
+            _push(cruise_log_api, load_user_ids(USERS_CRUISE_LOG_FILE), text, "cruise_log")
+        else:
+            _push(cruise_api, load_user_ids(USERS_CRUISE_FILE), text, "cruise(fallback)")
 
 
 def _body_head(text: str, limit: int = 200) -> str:
@@ -154,9 +165,11 @@ def main():
 
     costco_token = (os.getenv("LINE_COSTCO_CHANNEL_ACCESS_TOKEN") or "").strip()
     cruise_token = (os.getenv("LINE_CRUISE_CHANNEL_ACCESS_TOKEN") or "").strip()
+    cruise_log_token = (os.getenv("LINE_CRUISE_CHANNEL_LOG_ACCESS_TOKEN") or "").strip()
 
     costco_api = LineBotApi(costco_token) if costco_token else None
     cruise_api = LineBotApi(cruise_token) if cruise_token else None
+    cruise_log_api = LineBotApi(cruise_log_token) if cruise_log_token else None
 
     started_at = time.time()
     state = {
@@ -193,7 +206,7 @@ def main():
                     now = time.time()
                     if (now - started_at) >= STARTUP_GRACE_SECONDS:
                         msg = f"[{ts()}] 【系統監控】{name} 已恢復正常。"
-                        notify(scope, msg, features, costco_api, cruise_api)
+                        notify(scope, msg, features, costco_api, cruise_api, cruise_log_api)
 
                 state[name]["fails"] = 0
                 state[name]["down"] = False
@@ -222,7 +235,7 @@ def main():
 
             state[name]["down"] = True
             msg = f"[{ts()}] 【系統監控】偵測到 {name} 可能已停止（連續 {int(now - first_fail_at)} 秒無回應）：{err}。"
-            notify(scope, msg, features, costco_api, cruise_api)
+            notify(scope, msg, features, costco_api, cruise_api, cruise_log_api)
         time.sleep(CHECK_INTERVAL_SECONDS)
 
 

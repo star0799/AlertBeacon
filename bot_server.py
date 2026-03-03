@@ -66,13 +66,18 @@ costco_handler = WebhookHandler(COSTCO_CHANNEL_SECRET)
 # Cruise
 CRUISE_TOKEN = os.getenv("LINE_CRUISE_CHANNEL_ACCESS_TOKEN")
 CRUISE_SECRET = os.getenv("LINE_CRUISE_CHANNEL_SECRET")
+CRUISE_LOG_TOKEN = os.getenv("LINE_CRUISE_CHANNEL_LOG_ACCESS_TOKEN")
+CRUISE_LOG_SECRET = os.getenv("LINE_CRUISE_CHANNEL_LOG_SECRET")
 CRUISE_ADMIN_KEY = os.getenv("CRUISE_ADMIN_KEY")
 
 cruise_line_bot_api = _bind_line_api_default_timeout(LineBotApi(CRUISE_TOKEN))
 cruise_handler = WebhookHandler(CRUISE_SECRET)
+cruise_log_line_bot_api = _bind_line_api_default_timeout(LineBotApi(CRUISE_LOG_TOKEN)) if CRUISE_LOG_TOKEN else None
+cruise_log_handler = WebhookHandler(CRUISE_LOG_SECRET) if CRUISE_LOG_SECRET else None
 
 USERS_FILE = "users.json"
 USERS_CRUISE_FILE = "users_cruise.json"
+USERS_CRUISE_LOG_FILE = "users_cruise_log.json"
 MONITORS_FILE = "monitors.json"
 TOKENS_CACHE_FILE = "latest_tokens.json"
 FEATURES_FILE = "features.json"
@@ -97,6 +102,15 @@ _latest_tokens = {
 CRUISE_RELOGIN_NEEDED = False
 LAST_RELOGIN_ALERT_AT = 0.0
 LAST_RECOVER_ALERT_AT = 0.0
+CRUISE_AVAILABILITY_NOTIFY_TYPES = {"CRUISE_CABIN_AVAILABLE", "CRUISE_TIER_AVAILABLE"}
+
+
+def _resolve_cruise_notify_target(event_type: str) -> tuple[LineBotApi | None, str, str]:
+    if event_type in CRUISE_AVAILABILITY_NOTIFY_TYPES:
+        return cruise_line_bot_api, USERS_CRUISE_FILE, "cruise"
+    if cruise_log_line_bot_api:
+        return cruise_log_line_bot_api, USERS_CRUISE_LOG_FILE, "cruise_log"
+    return cruise_line_bot_api, USERS_CRUISE_FILE, "cruise_fallback"
 
 @app.post("/cruise/tokens")
 def cruise_tokens():
@@ -131,15 +145,18 @@ def cruise_tokens():
     if should_notify:
         now = time.time()
         if now - LAST_RECOVER_ALERT_AT >= 60:
-            users = read_json(USERS_CRUISE_FILE, [])
-            if users:
+            line_api, users_file, channel_label = _resolve_cruise_notify_target("CRUISE_TOKEN_RECOVERED")
+            users = read_json(users_file, [])
+            if line_api and users:
                 msg = TextSendMessage(text="✅ Cruise token 已更新，監控已恢復")
                 for uid in users:
                     try:
-                        cruise_line_bot_api.push_message(uid, msg)
+                        line_api.push_message(uid, msg)
                     except Exception as e:
-                        print(f"[{ts()}] [CRUISE] notify failed:", uid, repr(e), flush=True)
+                        print(f"[{ts()}] [CRUISE] notify failed channel={channel_label}:", uid, repr(e), flush=True)
                 LAST_RECOVER_ALERT_AT = now
+            elif not line_api:
+                print(f"[{ts()}] [CRUISE] notify skipped: no LINE api channel={channel_label}", flush=True)
         CRUISE_RELOGIN_NEEDED = False
     return jsonify({"ok": True})
 
@@ -715,11 +732,13 @@ def cruise_notify():
         print(f"[{ts()}] [CRUISE] cruise disabled", flush=True)
         return jsonify({"ok": False, "error": "cruise disabled"}), 503
 
-    users = read_json(USERS_CRUISE_FILE, [])
-    if not users:
-        return jsonify({"ok": False, "error": "no cruise users yet"}), 400
-
     t = data.get("type", "CRUISE")
+    line_api, users_file, channel_label = _resolve_cruise_notify_target(t)
+    if not line_api:
+        return jsonify({"ok": False, "error": f"LINE API not configured for channel={channel_label}"}), 503
+    users = read_json(users_file, [])
+    if not users:
+        return jsonify({"ok": False, "error": f"no users yet for channel={channel_label}"}), 400
 
     if t == "CRUISE_CABIN_AVAILABLE":
         total = data.get("totalItems")
@@ -773,12 +792,12 @@ def cruise_notify():
     errors = []
     for uid in users:
         try:
-            cruise_line_bot_api.push_message(uid, msg_obj)
+            line_api.push_message(uid, msg_obj)
             ok_count += 1
         except Exception as e:
             errors.append({"user": uid, "error": str(e)})
 
-    return jsonify({"ok": True, "sent": ok_count, "errors": errors})
+    return jsonify({"ok": True, "sent": ok_count, "errors": errors, "channel": channel_label})
 
 @app.post("/cruise/test_push")
 def cruise_test_push():
@@ -939,31 +958,38 @@ def _unauthorized_error(action: str) -> str:
 
 
 def _notify_cruise_action_failed(action: str, detail: str = "") -> None:
-    users = read_json(USERS_CRUISE_FILE, [])
+    line_api, users_file, channel_label = _resolve_cruise_notify_target("CRUISE_ACTION_FAILED")
+    if not line_api:
+        print(
+            f"[{ts()}] [CRUISE] action notify skipped: LINE api missing action={action} channel={channel_label}",
+            flush=True,
+        )
+        return
+    users = read_json(users_file, [])
+    if not users:
+        print(
+            f"[{ts()}] [CRUISE] action notify skipped: no users action={action} channel={channel_label}",
+            flush=True,
+        )
+        return
     label = _action_label(action)
     msg_text = f"⚠️ Cruise {label} 操作失敗"
     if detail:
         msg_text += f"\n{detail}"
-    if users:
-        ok_count = 0
-        error_count = 0
-        msg = TextSendMessage(text=msg_text)
-        for uid in users:
-            try:
-                cruise_line_bot_api.push_message(uid, msg)
-                ok_count += 1
-            except Exception as e:
-                error_count += 1
-                print(f"[{ts()}] [CRUISE] action notify failed:", uid, repr(e), flush=True)
-        print(
-            f"[{ts()}] [CRUISE] action notify done action={action} sent={ok_count} errors={error_count}",
-            flush=True,
-        )
-    else:
-        print(
-            f"[{ts()}] [CRUISE] action notify skipped: no cruise users action={action}",
-            flush=True,
-        )
+    ok_count = 0
+    error_count = 0
+    msg = TextSendMessage(text=msg_text)
+    for uid in users:
+        try:
+            line_api.push_message(uid, msg)
+            ok_count += 1
+        except Exception as e:
+            error_count += 1
+            print(f"[{ts()}] [CRUISE] action notify failed channel={channel_label}:", uid, repr(e), flush=True)
+    print(
+        f"[{ts()}] [CRUISE] action notify done action={action} channel={channel_label} sent={ok_count} errors={error_count}",
+        flush=True,
+    )
 
 
 def _handle_unauthorized(
@@ -988,8 +1014,9 @@ def trigger_relogin(reason: str, detail: str = "") -> None:
         print(f"[{ts()}] [CRUISE] relogin already needed reason={reason}", flush=True)
         return
 
-    users = read_json(USERS_CRUISE_FILE, [])
-    if users:
+    line_api, users_file, channel_label = _resolve_cruise_notify_target("CRUISE_NEED_RELOGIN")
+    users = read_json(users_file, [])
+    if users and line_api:
         ok_count = 0
         error_count = 0
         msg_text = (
@@ -1000,18 +1027,18 @@ def trigger_relogin(reason: str, detail: str = "") -> None:
         msg = TextSendMessage(text=msg_text)
         for uid in users:
             try:
-                cruise_line_bot_api.push_message(uid, msg)
+                line_api.push_message(uid, msg)
                 ok_count += 1
             except Exception as e:
                 error_count += 1
-                print(f"[{ts()}] [CRUISE] relogin notify failed:", uid, repr(e), flush=True)
+                print(f"[{ts()}] [CRUISE] relogin notify failed channel={channel_label}:", uid, repr(e), flush=True)
         print(
-            f"[{ts()}] [CRUISE] relogin notify done sent={ok_count} errors={error_count} reason={reason}",
+            f"[{ts()}] [CRUISE] relogin notify done channel={channel_label} sent={ok_count} errors={error_count} reason={reason}",
             flush=True,
         )
     else:
         print(
-            f"[{ts()}] [CRUISE] relogin notify skipped: no cruise users reason={reason}",
+            f"[{ts()}] [CRUISE] relogin notify skipped: no users reason={reason} channel={channel_label}",
             flush=True,
         )
 
@@ -3232,6 +3259,10 @@ def add_cruise_user(user_id: str):
 # ------------------------------------------------------
 # 商品名稱 / 即時查庫存
 # ------------------------------------------------------
+def add_cruise_log_user(user_id: str):
+    _add_user_to_file(user_id, USERS_CRUISE_LOG_FILE, "[CRUISE LOG] add user")
+
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -3323,6 +3354,13 @@ def callback_costco():
 @app.route("/callback/cruise", methods=["POST"])
 def callback_cruise():
     return _handle_callback(cruise_handler)
+
+
+@app.route("/callback/log", methods=["POST"])
+def callback_log():
+    if cruise_log_handler is None:
+        return jsonify({"ok": False, "error": "log channel secret missing"}), 503
+    return _handle_callback(cruise_log_handler)
 
 
 # ------------------------------------------------------
@@ -3554,6 +3592,13 @@ def handle_costco_message(event):
     )
 
     costco_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=help_text))
+
+
+if cruise_log_handler:
+    @cruise_log_handler.add(MessageEvent, message=TextMessage)
+    def handle_cruise_log_message(event):
+        user_id = event.source.user_id
+        add_cruise_log_user(user_id)
 
 
 @cruise_handler.add(MessageEvent, message=TextMessage)
