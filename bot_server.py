@@ -2041,6 +2041,14 @@ def _parse_flexible_date(text: str) -> str | None:
         return None
 
 
+def _is_past_date(date_text: str) -> bool:
+    try:
+        target = datetime.strptime(date_text, "%Y-%m-%d").date()
+    except Exception:
+        return False
+    return target < datetime.now().date()
+
+
 def _normalize_room_token(text: str) -> str:
     s = (text or "").strip()
     if s.endswith("房"):
@@ -3921,6 +3929,12 @@ def handle_cruise_message(event):
             "全部指令日期支援 YYYY-MM-DD / YYYYMMDD / YYYY/MM/DD / YYYY.MM.DD\n"
         )
         cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=help_text))
+        return
+
+    if _is_past_date(date):
+        today_text = datetime.now().strftime("%Y-%m-%d")
+        reply = f"日期不可小於今天（今天：{today_text}，你輸入：{date}），不會新增監控。"
+        cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
 
     if any(k in raw_text for k in ("露台", "露臺", "陽台")):

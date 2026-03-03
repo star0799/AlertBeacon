@@ -1,6 +1,7 @@
 import json
 import os
 import time
+from datetime import datetime
 import requests
 from dotenv import load_dotenv
 from filelock import FileLock
@@ -194,6 +195,46 @@ def read_monitors():
         return read_json(MONITORS_FILE, [])
 
 
+def prune_past_monitors() -> int:
+    today = datetime.now().date()
+    lock = FileLock(MONITORS_FILE + ".lock")
+    with lock:
+        monitors = read_json(MONITORS_FILE, [])
+        if not isinstance(monitors, list):
+            return 0
+
+        kept = []
+        removed = []
+        for monitor in monitors:
+            if not isinstance(monitor, dict):
+                kept.append(monitor)
+                continue
+            date_text = monitor.get("departure_date") or monitor.get("date")
+            if not isinstance(date_text, str):
+                kept.append(monitor)
+                continue
+            try:
+                monitor_date = datetime.strptime(date_text.strip(), "%Y-%m-%d").date()
+            except Exception:
+                kept.append(monitor)
+                continue
+            if monitor_date < today:
+                removed.append(monitor)
+                continue
+            kept.append(monitor)
+
+        if len(kept) != len(monitors):
+            write_json(MONITORS_FILE, kept)
+
+    if removed:
+        keys = [str(make_monitor_key(m)) for m in removed[:10]]
+        print(
+            f"[{ts()}] [DAEMON] pruned past monitors count={len(removed)} keys={keys}",
+            flush=True,
+        )
+    return len(removed)
+
+
 def update_monitor_fields(monitor_key: tuple, updates: dict):
     lock = FileLock(MONITORS_FILE + ".lock")
     with lock:
@@ -352,6 +393,7 @@ def main():
             print(f"[{ts()}] ✅ Cruise 監控已啟用，恢復檢查", flush=True)
             paused = False
 
+        prune_past_monitors()
         write_heartbeat("running")
         try:
             tokens, token_state, token_err = get_tokens()
