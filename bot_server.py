@@ -2213,7 +2213,7 @@ def _find_fc_matches(
             return None, "常用旅客比對到多筆結果，請補充更多資訊（護照號碼或生日）"
         return matches[0], None
 
-    return None, f"找不到{token}的親友資料，請先加入常用旅客或補 private_people.json"
+    return None, f"找不到{token}的親友資料，請確認官網親友名單；若使用別名再補 private_people.json alias/hints"
 def _merge_dict(base: dict, override: dict) -> dict:
     merged = dict(base or {})
     for k, v in (override or {}).items():
@@ -2240,6 +2240,80 @@ def _map_fc_to_passenger(fc: dict) -> dict:
         "passport_issuance_date": fc.get("passport_issuance_date") or "",
         "passport_expiry_date": fc.get("passport_expiry_date") or "",
     }
+
+
+def _private_entry_passenger_parts(entry: dict | None) -> tuple[dict, dict]:
+    passenger = entry.get("passenger") if isinstance(entry, dict) and isinstance(entry.get("passenger"), dict) else {}
+    overrides = (
+        entry.get("passenger_overrides")
+        if isinstance(entry, dict) and isinstance(entry.get("passenger_overrides"), dict)
+        else {}
+    )
+    return passenger, overrides
+
+
+def _resolve_fc_passenger_from_list(
+    fc_list: list,
+    token: str,
+    entry: dict | None = None,
+) -> tuple[dict | None, int | None, str | None]:
+    passenger, overrides = _private_entry_passenger_parts(entry)
+    hints = dict(passenger) if passenger else {}
+    if overrides:
+        hints = _merge_dict(hints, overrides)
+
+    fc_person, err = _find_fc_matches(fc_list, token, hints)
+    if err:
+        return None, None, err
+
+    fc_id_raw = fc_person.get("id")
+    try:
+        fc_id = int(fc_id_raw)
+    except Exception:
+        fc_id = None
+    if not fc_id:
+        return None, None, f"找不到{token}的親友資料，請確認官網親友名單；若使用別名再補 private_people.json alias/hints"
+
+    base = _map_fc_to_passenger(fc_person)
+    if overrides:
+        base = _merge_dict(base, overrides)
+    return base, fc_id, None
+
+
+def _finalize_passenger_fields(
+    base: dict,
+    label: str,
+    *,
+    is_main: bool,
+    is_member: bool,
+    require_phone: bool = False,
+) -> tuple[dict | None, str | None]:
+    base = dict(base or {})
+    base["gender"] = _normalize_gender(base.get("gender"))
+    if base.get("phone_number"):
+        base["phone_number"] = _normalize_phone_digits(base.get("phone_number"))
+    nat = base.get("nationality")
+    if not base.get("passport_issuance_country"):
+        if nat:
+            base["passport_issuance_country"] = nat
+        else:
+            return None, f"{label}缺少 passport_issuance_country"
+    if not base.get("nationality"):
+        base["nationality"] = "TW"
+    if base.get("email"):
+        base["re-email"] = base.get("email")
+    if is_main and require_phone and not base.get("phone_number"):
+        return None, "主乘客缺少 phone_number，請到 SDC 常用旅客資料補齊再試"
+
+    missing = _require_fields(
+        base,
+        label,
+        require_contact=is_main,
+        require_passport=is_member or is_main,
+    )
+    if missing:
+        return None, "缺少必填欄位：" + ", ".join(missing)
+    return base, None
 
 
 def _normalize_gender(value: str) -> str:
@@ -2576,34 +2650,79 @@ def reply_long_message(
 def _prepare_passengers_from_private(names: list[str]) -> tuple[dict | None, list | None, dict | None, list]:
     people, emergencies = _load_private_people()
     errors = []
+    access_token = get_latest_access_token()
+    login_customer_id = (_latest_tokens or {}).get("customer_id") or (_latest_tokens or {}).get("user_mmid")
+    fc_list = None
+    fc_list_error = None
 
-    def _build_private_passenger(token: str, label: str) -> dict | None:
-        entry = _match_alias(token, people)
-        if not entry:
-            errors.append(f"找不到{label}資料：{label}({token})")
+    def get_fc_list() -> list | None:
+        nonlocal fc_list, fc_list_error
+        if fc_list is not None:
+            return fc_list
+        if fc_list_error is not None:
             return None
-        passenger = entry.get("passenger") if isinstance(entry.get("passenger"), dict) else {}
-        overrides = entry.get("passenger_overrides") if isinstance(entry.get("passenger_overrides"), dict) else {}
-        base = _merge_dict(passenger, overrides)
-        base["gender"] = _normalize_gender(base.get("gender"))
-        if not base.get("nationality"):
-            base["nationality"] = "TW"
-        if base.get("email"):
-            base["re-email"] = base.get("email")
+        if not access_token:
+            fc_list_error = "尚未登入/未同步 token，無法取得常用旅客清單"
+            errors.append(fc_list_error)
+            return None
+        try:
+            fc_list, _ = _fetch_fc_list(access_token)
+        except PermissionError:
+            fc_list_error = _unauthorized_error("frequent-cruisers")
+            errors.append(fc_list_error)
+            return None
+        except Exception as ex:
+            fc_list_error = f"無法取得常用旅客清單：{type(ex).__name__}"
+            errors.append(fc_list_error)
+            return None
+        return fc_list
+
+    def _build_private_passenger(token: str, label: str, is_main: bool) -> dict | None:
+        entry = _match_alias(token, people)
         if is_main:
-            require_contact = True
-            require_passport = True
+            if not entry:
+                errors.append(f"找不到{label}資料：{label}({token})")
+                return None
+            is_member = bool(entry.get("is_member"))
+            mmid = entry.get("mmid")
+            if not is_member or not isinstance(mmid, str) or not mmid.strip():
+                errors.append("主乘客必須在 private_people.json 設定 is_member=true 並填 mmid")
+                return None
+            if login_customer_id and str(mmid).strip() != str(login_customer_id).strip():
+                errors.append(
+                    f"主乘客帳號不合：當前登入 customer_id={login_customer_id} ，主乘客 mmid={mmid} 。請切換登入主乘客帳號後再試"
+                )
+                return None
+            passenger, overrides = _private_entry_passenger_parts(entry)
+            base = _merge_dict(passenger, overrides)
         else:
-            require_contact = False
-            require_passport = is_member
-        missing = _require_fields(
+            is_member = bool(entry and entry.get("is_member"))
+            if is_member:
+                mmid = entry.get("mmid")
+                if not isinstance(mmid, str) or not mmid.strip():
+                    errors.append("會員乘客缺少 mmid，請在 private_people.json 補齊")
+                    return None
+                passenger, overrides = _private_entry_passenger_parts(entry)
+                base = _merge_dict(passenger, overrides)
+            else:
+                fc_list_local = get_fc_list()
+                if fc_list_local is None:
+                    return None
+                base, fc_id, err = _resolve_fc_passenger_from_list(fc_list_local, token, entry)
+                if err:
+                    errors.append(err)
+                    return None
+                base["type"] = "frequent_cruiser"
+                base["fc_id"] = fc_id
+
+        base, err = _finalize_passenger_fields(
             base,
             label,
-            require_contact=require_contact,
-            require_passport=require_passport,
+            is_main=is_main,
+            is_member=is_member,
         )
-        if missing:
-            errors.append("缺少必填欄位：" + ", ".join(missing))
+        if err:
+            errors.append(err)
             return None
         return base
 
@@ -2867,15 +2986,14 @@ def _resolve_passengers_and_emergency(
 
     def _build_resolved_passenger(token: str, label: str, is_main: bool) -> tuple[dict | None, str | None]:
         entry = _match_alias(token, people)
-        if not entry:
-            return None, f"找不到{label}資料，請在 private_people.json 補 alias"
-        is_member = bool(entry and entry.get("is_member"))
         if is_main:
+            if not entry:
+                return None, f"找不到{label}資料，請在 private_people.json 補 alias"
+            is_member = bool(entry.get("is_member"))
             mmid = entry.get("mmid") if isinstance(entry, dict) else None
             if is_member and isinstance(mmid, str) and mmid.strip():
                 if str(mmid).strip() == str(login_customer_id).strip():
-                    passenger = entry.get("passenger") if isinstance(entry.get("passenger"), dict) else {}
-                    overrides = entry.get("passenger_overrides") if isinstance(entry.get("passenger_overrides"), dict) else {}
+                    passenger, overrides = _private_entry_passenger_parts(entry)
                     base = _merge_dict(passenger, overrides)
                 else:
                     return None, (
@@ -2885,13 +3003,13 @@ def _resolve_passengers_and_emergency(
             else:
                 return None, "主乘客必須在 private_people.json 設定 is_member=true 並填 mmid (用於登入者比對)"
         else:
+            is_member = bool(entry and entry.get("is_member"))
             if is_member:
                 mmid = entry.get("mmid")
                 if not isinstance(mmid, str) or not mmid.strip():
                     return None, "會員乘客缺少 mmid，請在 private_people.json 補齊"
 
-                passenger = entry.get("passenger") if isinstance(entry.get("passenger"), dict) else {}
-                overrides = entry.get("passenger_overrides") if isinstance(entry.get("passenger_overrides"), dict) else {}
+                passenger, overrides = _private_entry_passenger_parts(entry)
                 base = _merge_dict(passenger, overrides)
                 ok, result = _validate_mmid(
                     access_token,
@@ -2909,29 +3027,9 @@ def _resolve_passengers_and_emergency(
                 except PermissionError:
                     return None, _unauthorized_error("frequent-cruisers")
 
-                overrides = {}
-                hints = {}
-                if entry:
-                    if isinstance(entry.get("passenger"), dict):
-                        hints = dict(entry.get("passenger"))
-                    if isinstance(entry.get("passenger_overrides"), dict):
-                        overrides = dict(entry.get("passenger_overrides"))
-                        hints = _merge_dict(hints, overrides)
-
-                fc_person, err = _find_fc_matches(fc_list_local, token, hints)
+                base, fc_id, err = _resolve_fc_passenger_from_list(fc_list_local, token, entry)
                 if err:
                     return None, err
-                fc_id_raw = fc_person.get("id")
-                try:
-                    fc_id = int(fc_id_raw)
-                except Exception:
-                    fc_id = None
-                if not fc_id:
-                    return None, f"找不到{token}的親友資料，請先加入常用旅客或補 private_people.json"
-
-                base = _map_fc_to_passenger(fc_person)
-                if overrides:
-                    base = _merge_dict(base, overrides)
                 base["type"] = "frequent_cruiser"
                 base["fc_id"] = fc_id
 
@@ -2945,29 +3043,15 @@ def _resolve_passengers_and_emergency(
                 if not ok:
                     return None, f"常用旅客驗證失敗：{result}"
                 base = merge_validate_fields(base, result if isinstance(result, dict) else {})
-        base["gender"] = _normalize_gender(base.get("gender"))
-        if base.get("phone_number"):
-            base["phone_number"] = _normalize_phone_digits(base.get("phone_number"))
-        nat = base.get("nationality")
-        if not base.get("passport_issuance_country"):
-            if nat:
-                base["passport_issuance_country"] = nat
-            else:
-                return None, f"{label}缺少 passport_issuance_country"
-        if not base.get("nationality"):
-            base["nationality"] = "TW"
-        if base.get("email"):
-            base["re-email"] = base.get("email")
-        if is_main and require_phone and not base.get("phone_number"):
-            return None, "主乘客缺少 phone_number，請到 SDC 常用旅客資料補齊再試"
-        missing = _require_fields(
+        base, err = _finalize_passenger_fields(
             base,
             label,
-            require_contact=is_main,
-            require_passport=is_member or is_main,
+            is_main=is_main,
+            is_member=is_member,
+            require_phone=require_phone,
         )
-        if missing:
-            return None, "缺少必填欄位：" + ", ".join(missing)
+        if err:
+            return None, err
         return base, None
 
     main_passenger, err = _build_resolved_passenger(main_token, "主乘客", True)
