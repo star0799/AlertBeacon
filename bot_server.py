@@ -943,6 +943,7 @@ _ACTION_LABELS = {
     "validate-mmid": "會員驗證",
     "frequent-cruisers": "親友名單",
     "frequent-cruisers-customer": "親友名單",
+    "customer-report": "查詢積分",
 }
 
 
@@ -2126,6 +2127,30 @@ def _fetch_fc_list(access_token: str) -> tuple[list, str | None]:
                     break
         return fc_list, customer_mmid
     return [], customer_mmid
+
+
+def _fetch_customer_report(access_token: str) -> dict:
+    url = f"{CRUISE_BACKEND_BASE}/auth/customer/report"
+    r = request_cruise("GET", url, access_token=access_token, headers_type="payment")
+    if _handle_unauthorized(r.status_code, "customer-report", f"status={r.status_code}", notify_mode="action_fail"):
+        raise PermissionError("customer-report unauthorized")
+    r.raise_for_status()
+    payload = r.json() or {}
+    if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+        return payload.get("data")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _build_customer_points_text(report: dict) -> str:
+    if not isinstance(report, dict):
+        return "查無積分資料"
+    name = report.get("name") or _full_name(report) or _chinese_name(report) or report.get("id")
+    return "\n".join([
+        f"主乘客: {_fmt_field(name)}",
+        f"客房積分: {_fmt_field(report.get('cabin_credits'))}",
+        f"獎勵積分: {_fmt_field(report.get('genting_points'))}",
+        f"等級積分: {_fmt_field(report.get('tier_points'))}",
+    ])
 
 
 def _match_fc_person(fc_list: list, fc_match: dict) -> dict | None:
@@ -3853,6 +3878,30 @@ def handle_cruise_message(event):
             line_user_id=user_id,
         )
         return
+    if raw_text in ("積分", "客房積分", "獎勵積分", "奖励积分", "等級積分", "等级积分"):
+        access = get_latest_access_token()
+        if not access:
+            reply = "請先手動登入一次讓 Token Sync 回灌"
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
+        try:
+            report = _fetch_customer_report(access)
+        except PermissionError:
+            reply = _unauthorized_error("customer-report")
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
+        except requests.HTTPError as ex:
+            status = ex.response.status_code if getattr(ex, "response", None) is not None else None
+            reply = f"查詢積分失敗 (status={status})" if status else "查詢積分失敗"
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
+        except Exception as ex:
+            reply = f"查詢積分失敗：{type(ex).__name__}"
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
+        reply = _build_customer_points_text(report)
+        cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
     if raw_text.startswith(("訂房", "订房")):
         if not is_cruise_daemon_enabled():
             reply = "訂房功能目前未啟用"
@@ -4009,6 +4058,7 @@ def handle_cruise_message(event):
             "例如：2026-02-27 海景\n"
             "刪除/del YYYY-MM-DD\n"
             "緊急聯絡人 / 親友名單\n"
+            "積分 / 客房積分 / 獎勵積分 / 等級積分\n"
             "訂房完整格式如：訂房 2026/02/22 海景房 周惠X 李X樂 李X貴 李X昇\n"
             "全部指令日期支援 YYYY-MM-DD / YYYYMMDD / YYYY/MM/DD / YYYY.MM.DD\n"
         )
