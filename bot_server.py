@@ -14,6 +14,7 @@ import requests
 import secrets
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from dotenv import load_dotenv
 from filelock import FileLock
 
@@ -86,6 +87,9 @@ STATE_DIR = "state"
 os.makedirs(STATE_DIR, exist_ok=True)
 PAY_LINKS_FILE = os.path.join(STATE_DIR, "pay_links.json")
 PAY_LINKS_LOCK = os.path.join(STATE_DIR, "pay_links.json.lock")
+PENDING_RWCC_CONFIRM_FILE = os.path.join(STATE_DIR, "pending_rwcc_confirm.json")
+PENDING_RWCC_CONFIRM_LOCK = os.path.join(STATE_DIR, "pending_rwcc_confirm.json.lock")
+PENDING_RWCC_CONFIRM_TTL_SECONDS = 300
 CRUISE_ADMINS_FILE = os.path.join(STATE_DIR, "cruise_admins.json")
 PRIVATE_PEOPLE_FILE = os.path.join(STATE_DIR, "private_people.json")
 CRUISE_BACKEND_BASE = "https://backend-prd.b2m.stardreamcruises.com"
@@ -1835,6 +1839,180 @@ def _update_paylink_url(code: str, pay_url: str) -> None:
             write_json_atomic(PAY_LINKS_FILE, links)
 
 
+def _refresh_booking_for_payment(access_token: str, booking_id: int, fallback_rut: str | None) -> tuple[dict | None, str | None]:
+    booking_summary = fetch_booking_summary(access_token, booking_id) or {}
+    if not isinstance(booking_summary, dict):
+        booking_summary = {}
+    latest_record_updated_time = _extract_record_updated_time(booking_summary, fallback_rut)
+    return booking_summary, latest_record_updated_time
+
+
+def _create_credit_card_paylink_for_booking(
+    booking_id: int,
+    record_updated_time: str,
+    ttl_seconds: int,
+    booking_summary: dict | None,
+) -> tuple[dict, int]:
+    payment_method = _build_payment_items("credit_card", include_surcharge=False)
+    if not payment_method:
+        return {"ok": False, "error": "invalid payment_method"}, 400
+    paylink_entry = create_paylink_entry(
+        booking_id=booking_id,
+        record_updated_time=record_updated_time,
+        payment_method=payment_method,
+        ttl_seconds=ttl_seconds,
+    )
+    if not paylink_entry:
+        return {"ok": False, "error": "無法建立付款連結"}, 500
+
+    pay_url = f"{_get_base_url()}/cruise/pay/{paylink_entry['code']}"
+    _update_paylink_url(paylink_entry["code"], pay_url)
+    summary_text = build_paylink_summary_text(
+        booking_id=booking_id,
+        pay_url=pay_url,
+        ttl_seconds=ttl_seconds,
+        booking_summary=booking_summary if isinstance(booking_summary, dict) else None,
+    )
+    return {
+        "ok": True,
+        "summary_text": summary_text,
+        "pay_url": pay_url,
+        "expires_at": datetime.fromtimestamp(paylink_entry["expires_at"], timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }, 200
+
+
+def _pay_port_charge_with_rwcc(
+    booking_id: int,
+    record_updated_time: str,
+    required_rwcc_points: str | None = None,
+) -> tuple[dict, int]:
+    access_token = get_latest_access_token()
+    if not access_token:
+        return {"ok": False, "error": "請先手動登入一次讓 Token Sync 回灌"}, 401
+
+    payment_method = _build_payment_items("rwcc_points", include_surcharge=False)
+    if not payment_method:
+        return {"ok": False, "error": "invalid payment_method"}, 400
+
+    body = {
+        "booking_id": booking_id,
+        "payment_method": [item for item in payment_method if item.get("payment_for") == "Port Charge"],
+        "recordUpdatedTime": record_updated_time,
+    }
+    url = f"{CRUISE_BACKEND_BASE}/customers/v2/booking/payment/{booking_id}"
+    try:
+        r = request_cruise("POST", url, access_token=access_token, headers_type="payment", json=body)
+    except Exception as ex:
+        return {"ok": False, "error": f"客房積分兌換失敗：{type(ex).__name__}"}, 502
+
+    if _handle_unauthorized(r.status_code, "payment", f"status={r.status_code}", notify_mode="action_fail"):
+        return {"ok": False, "error": _unauthorized_error("payment")}, 401
+    if r.status_code >= 400:
+        detail = ""
+        try:
+            detail = json.dumps(r.json() or {}, ensure_ascii=False)[:500]
+        except Exception:
+            detail = (r.text or "")[:500]
+        return {"ok": False, "error": f"客房積分兌換失敗 (status={r.status_code})", "detail": detail}, 502
+
+    payload = {}
+    try:
+        payload = r.json() or {}
+    except Exception:
+        payload = {}
+    cs = (payload.get("cybersource_response") or {}) if isinstance(payload, dict) else {}
+    if cs.get("endPoint"):
+        return {"ok": False, "error": "客房積分付款 unexpectedly returned cybersource flow"}, 502
+
+    refreshed_summary = {}
+    latest_record_updated_time = record_updated_time
+    status_text = ""
+    for attempt in range(2):
+        refreshed_summary, latest_record_updated_time = _refresh_booking_for_payment(
+            access_token,
+            booking_id,
+            latest_record_updated_time,
+        )
+        status_text = (refreshed_summary.get("port_charge_status") or "").strip().lower()
+        if status_text == "paid":
+            break
+        if attempt == 0:
+            time.sleep(1)
+    if status_text != "paid":
+        return {
+            "ok": False,
+            "error": f"客房積分兌換後港務費狀態仍為 {status_text or 'unknown'}",
+            "detail": payload if isinstance(payload, dict) else {},
+        }, 502
+
+    required_text = _fmt_decimal(required_rwcc_points) if required_rwcc_points is not None else ""
+    lines = [
+        "✅ 已使用客房積分抵扣港務費",
+        f"訂單：{booking_id}",
+    ]
+    if required_text:
+        lines.append(f"本次抵扣：{required_text} 客房積分")
+    if isinstance(refreshed_summary, dict):
+        date_text = refreshed_summary.get("departure_date")
+        itinerary = refreshed_summary.get("traditional_chinese_itinerary_name") or refreshed_summary.get("itinerary_name")
+        cabin_name = refreshed_summary.get("traditional_chinese_cabin_name") or refreshed_summary.get("cabin_name")
+        if date_text:
+            lines.append(f"日期：{date_text}")
+        if itinerary:
+            lines.append(f"航程：{itinerary}")
+        if cabin_name:
+            lines.append(f"房型：{cabin_name}")
+    return {
+        "ok": True,
+        "summary_text": "\n".join(lines),
+        "recordUpdatedTime": latest_record_updated_time,
+        "booking_summary": refreshed_summary if isinstance(refreshed_summary, dict) else None,
+    }, 200
+
+
+def _continue_rwcc_pending(line_user_id: str, use_rwcc: bool) -> tuple[dict, int]:
+    pending = _get_rwcc_pending(line_user_id)
+    if not pending:
+        return {"ok": False, "error": "沒有待確認的客房積分訂單，請重新下訂"}, 400
+
+    try:
+        booking_id = int(pending.get("booking_id") or 0)
+    except Exception:
+        booking_id = 0
+    record_updated_time = pending.get("recordUpdatedTime")
+    ttl_seconds = int(pending.get("ttl_seconds") or 300)
+    required_rwcc_points = pending.get("required_rwcc_points")
+    if booking_id <= 0 or not isinstance(record_updated_time, str) or not record_updated_time.strip():
+        return {"ok": False, "error": "待確認訂單資料不完整，請重新下訂"}, 400
+
+    access_token = get_latest_access_token()
+    if not access_token:
+        return {"ok": False, "error": "請先手動登入一次讓 Token Sync 回灌"}, 401
+
+    booking_summary, latest_record_updated_time = _refresh_booking_for_payment(access_token, booking_id, record_updated_time)
+    if not latest_record_updated_time:
+        return {"ok": False, "error": "無法取得 recordUpdatedTime，請重新下訂"}, 400
+
+    if use_rwcc:
+        result, status = _pay_port_charge_with_rwcc(
+            booking_id=booking_id,
+            record_updated_time=latest_record_updated_time,
+            required_rwcc_points=required_rwcc_points,
+        )
+        if status == 200 and result.get("ok"):
+            _clear_rwcc_pending(line_user_id)
+        return result, status
+    result, status = _create_credit_card_paylink_for_booking(
+        booking_id=booking_id,
+        record_updated_time=latest_record_updated_time,
+        ttl_seconds=ttl_seconds,
+        booking_summary=booking_summary,
+    )
+    if status == 200 and result.get("ok"):
+        _clear_rwcc_pending(line_user_id)
+    return result, status
+
+
 def _log_backend_response(trace_id: str, label: str, resp: requests.Response):
     body = ""
     try:
@@ -2151,6 +2329,157 @@ def _build_customer_points_text(report: dict) -> str:
         f"獎勵積分: {_fmt_field(report.get('genting_points'))}",
         f"等級積分: {_fmt_field(report.get('tier_points'))}",
     ])
+
+
+def _to_decimal(value) -> Decimal | None:
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return value
+    try:
+        text = str(value).strip()
+        if not text:
+            return None
+        return Decimal(text)
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _fmt_decimal(value) -> str:
+    dec = _to_decimal(value)
+    if dec is None:
+        return ""
+    normalized = dec.normalize()
+    text = format(normalized, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _rwcc_confirmation_text(required_points, total_points) -> str:
+    need_text = _fmt_decimal(required_points) or "0"
+    total_text = _fmt_decimal(total_points) or "0"
+    return (
+        f"此行程可用客房積分{need_text}點來抵港務費，目前總共有{total_text}點，是否要用點數?\n"
+        "回覆：是 / 否"
+    )
+
+
+def _extract_rwcc_offer(booking_summary: dict) -> dict | None:
+    if not isinstance(booking_summary, dict):
+        return None
+    if (booking_summary.get("port_charge_status") or "").strip().lower() == "paid":
+        return None
+    port_charge_mode = booking_summary.get("port_charge_mode")
+    if not isinstance(port_charge_mode, dict):
+        return None
+    required_points = _to_decimal(port_charge_mode.get("rwcc_points"))
+    if required_points is None or required_points <= 0:
+        return None
+    port_charge_passengers = port_charge_mode.get("port_charge_passengers")
+    if not isinstance(port_charge_passengers, dict):
+        return None
+    rwcc_passengers = port_charge_passengers.get("rwcc_points")
+    if not isinstance(rwcc_passengers, list) or not any(
+        isinstance(item, dict) and (_to_decimal(item.get("port_charge")) or Decimal("0")) > 0
+        for item in rwcc_passengers
+    ):
+        return None
+    cabin_fare_points = _to_decimal(booking_summary.get("cabin_fare")) or Decimal("0")
+    total_required_points = cabin_fare_points + required_points
+    return {
+        "required_rwcc_points": required_points,
+        "cabin_fare_points": cabin_fare_points,
+        "total_required_cabin_credits": total_required_points,
+    }
+
+
+def _get_rwcc_confirmation_offer(access_token: str, booking_summary: dict) -> dict | None:
+    offer = _extract_rwcc_offer(booking_summary)
+    if not offer:
+        return None
+    try:
+        report = _fetch_customer_report(access_token)
+    except Exception as ex:
+        print(f"[{ts()}] [CRUISE] customer report skipped for rwcc offer: {type(ex).__name__}", flush=True)
+        return None
+
+    total_points = _to_decimal(report.get("cabin_credits"))
+    total_required_points = offer.get("total_required_cabin_credits") or Decimal("0")
+    if total_points is None or total_points <= 0 or total_points < total_required_points:
+        return None
+
+    return {
+        "required_rwcc_points": _fmt_decimal(offer.get("required_rwcc_points")),
+        "cabin_fare_points": _fmt_decimal(offer.get("cabin_fare_points")),
+        "total_required_cabin_credits": _fmt_decimal(total_required_points),
+        "available_cabin_credits": _fmt_decimal(total_points),
+        "prompt_text": _rwcc_confirmation_text(offer.get("required_rwcc_points"), total_points),
+    }
+
+
+def _mutate_rwcc_pending(mutator):
+    lock = FileLock(PENDING_RWCC_CONFIRM_LOCK)
+    with lock:
+        data = read_json(PENDING_RWCC_CONFIRM_FILE, {})
+        if not isinstance(data, dict):
+            data = {}
+        now = int(time.time())
+        expired_keys = []
+        for key, value in data.items():
+            if not isinstance(value, dict):
+                expired_keys.append(key)
+                continue
+            expires_at = int(value.get("expires_at") or 0)
+            if expires_at and expires_at <= now:
+                expired_keys.append(key)
+        for key in expired_keys:
+            data.pop(key, None)
+        result = mutator(data)
+        write_json_atomic(PENDING_RWCC_CONFIRM_FILE, data)
+        return result
+
+
+def _save_rwcc_pending(line_user_id: str, payload: dict) -> None:
+    if not line_user_id or not isinstance(payload, dict):
+        return
+
+    def _mutator(data: dict):
+        data[line_user_id] = payload
+
+    _mutate_rwcc_pending(_mutator)
+
+
+def _get_rwcc_pending(line_user_id: str) -> dict | None:
+    if not line_user_id:
+        return None
+
+    def _mutator(data: dict):
+        item = data.get(line_user_id)
+        return item if isinstance(item, dict) else None
+
+    return _mutate_rwcc_pending(_mutator)
+
+
+def _pop_rwcc_pending(line_user_id: str) -> dict | None:
+    if not line_user_id:
+        return None
+
+    def _mutator(data: dict):
+        item = data.pop(line_user_id, None)
+        return item if isinstance(item, dict) else None
+
+    return _mutate_rwcc_pending(_mutator)
+
+
+def _clear_rwcc_pending(line_user_id: str) -> None:
+    if not line_user_id:
+        return
+
+    def _mutator(data: dict):
+        data.pop(line_user_id, None)
+
+    _mutate_rwcc_pending(_mutator)
 
 
 def _match_fc_person(fc_list: list, fc_match: dict) -> dict | None:
@@ -2952,11 +3281,30 @@ def process_cruise_text_command(
             result["error_type"] = "parse_error"
         return result
     result["ok"] = True
-    result["actions"]["paylink"].update({
-        "pay_url": flow_result.get("pay_url"),
-        "expires_at": flow_result.get("expires_at"),
-        "summary_text": flow_result.get("summary_text"),
-    })
+    if flow_result.get("confirmation_required"):
+        expires_at = int(time.time()) + PENDING_RWCC_CONFIRM_TTL_SECONDS
+        _save_rwcc_pending(line_user_id, {
+            "booking_id": flow_result.get("booking_id"),
+            "recordUpdatedTime": flow_result.get("recordUpdatedTime"),
+            "required_rwcc_points": flow_result.get("required_rwcc_points"),
+            "available_cabin_credits": flow_result.get("available_cabin_credits"),
+            "total_required_cabin_credits": flow_result.get("total_required_cabin_credits"),
+            "ttl_seconds": flow_result.get("ttl_seconds") or 300,
+            "created_at": int(time.time()),
+            "expires_at": expires_at,
+        })
+        result["confirmation_required"] = True
+        result["confirmation_text"] = flow_result.get("confirmation_text") or flow_result.get("summary_text")
+        result["actions"]["paylink"]["attempted"] = False
+        result["actions"]["booking"]["pending_rwcc_confirmation"] = True
+        result["actions"]["booking"]["booking_id"] = flow_result.get("booking_id")
+        result["actions"]["booking"]["expires_at"] = expires_at
+    else:
+        result["actions"]["paylink"].update({
+            "pay_url": flow_result.get("pay_url"),
+            "expires_at": flow_result.get("expires_at"),
+            "summary_text": flow_result.get("summary_text"),
+        })
 
     if CRUISE_RELOGIN_NEEDED:
         result["relogin_required"] = True
@@ -3263,33 +3611,27 @@ def _book_and_paylink_with_people(
         if not latest_record_updated_time:
             return {"ok": False, "error": "無法取得 recordUpdatedTime，請重試"}, 400
 
-    payment_method = _build_payment_items("credit_card", include_surcharge=non_member_surcharge_id is not None)
-    if not payment_method:
-        return {"ok": False, "error": "invalid payment_method"}, 400
-    paylink_entry = create_paylink_entry(
+    rwcc_offer = _get_rwcc_confirmation_offer(access_token, booking_summary if isinstance(booking_summary, dict) else {})
+    if rwcc_offer:
+        return {
+            "ok": True,
+            "confirmation_required": True,
+            "summary_text": rwcc_offer.get("prompt_text"),
+            "confirmation_text": rwcc_offer.get("prompt_text"),
+            "booking_id": numeric_id,
+            "recordUpdatedTime": latest_record_updated_time,
+            "required_rwcc_points": rwcc_offer.get("required_rwcc_points"),
+            "available_cabin_credits": rwcc_offer.get("available_cabin_credits"),
+            "total_required_cabin_credits": rwcc_offer.get("total_required_cabin_credits"),
+            "ttl_seconds": ttl_seconds,
+        }, 200
+
+    return _create_credit_card_paylink_for_booking(
         booking_id=numeric_id,
         record_updated_time=latest_record_updated_time,
-        payment_method=payment_method,
-        ttl_seconds=ttl_seconds,
-    )
-    if not paylink_entry:
-        return {"ok": False, "error": "無法建立付款連結"}, 500
-
-    pay_url = f"{_get_base_url()}/cruise/pay/{paylink_entry['code']}"
-    _update_paylink_url(paylink_entry["code"], pay_url)
-    summary_text = build_paylink_summary_text(
-        booking_id=numeric_id,
-        pay_url=pay_url,
         ttl_seconds=ttl_seconds,
         booking_summary=booking_summary if isinstance(booking_summary, dict) else None,
     )
-
-    return {
-        "ok": True,
-        "summary_text": summary_text,
-        "pay_url": pay_url,
-        "expires_at": datetime.fromtimestamp(paylink_entry["expires_at"], timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }, 200
 
 def fetch_itinerary(access_token: str, date: str) -> str | None:
     url = f"{CRUISE_BACKEND_BASE}/customers/list/itinerary"
@@ -3751,6 +4093,21 @@ def handle_cruise_message(event):
         cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
 
+    pending_rwcc = _get_rwcc_pending(user_id)
+    yes_tokens = {"是", "好", "要", "yes", "y", "用點數", "用客房積分"}
+    no_tokens = {"否", "不要", "不用", "no", "n", "不用點數", "不用客房積分"}
+    if pending_rwcc and (raw_text in yes_tokens or raw_text_lower in yes_tokens or raw_text in no_tokens or raw_text_lower in no_tokens):
+        use_rwcc = raw_text in yes_tokens or raw_text_lower in yes_tokens
+        flow_result, status = _continue_rwcc_pending(user_id, use_rwcc=use_rwcc)
+        if status != 200 or not flow_result.get("ok"):
+            reply = flow_result.get("error") or "處理失敗，請重新下訂"
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
+        if not _send_cruise_booking_reply(flow_result, user_id, event.reply_token):
+            reply = flow_result.get("summary_text") or "處理完成"
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
+
     if raw_text in ("緊急聯絡人", "聯絡人"):
         _, emergencies = _load_private_people()
         names = []
@@ -3911,6 +4268,7 @@ def handle_cruise_message(event):
             reply = "你沒有訂房權限（僅限管理者）"
             cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
             return
+        _clear_rwcc_pending(event.source.user_id)
         result = process_cruise_text_command(
             text=raw_text,
             line_user_id=event.source.user_id,
@@ -4060,6 +4418,7 @@ def handle_cruise_message(event):
             "緊急聯絡人 / 親友名單\n"
             "積分 / 客房積分 / 獎勵積分 / 等級積分\n"
             "訂房完整格式如：訂房 2026/02/22 海景房 周惠X 李X樂 李X貴 李X昇\n"
+            "若收到客房積分提示，回覆：是 / 否\n"
             "全部指令日期支援 YYYY-MM-DD / YYYYMMDD / YYYY/MM/DD / YYYY.MM.DD\n"
         )
         cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=help_text))
