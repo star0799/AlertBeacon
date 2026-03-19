@@ -20,6 +20,12 @@ TIER_RULES_FILE = os.path.join(BASE_DIR, "cabin_name")
 FEATURES_FILE = os.path.join(BASE_DIR, "features.json")
 NO_ROOM_COOLDOWN_SECONDS = 0
 FEATURE_CHECK_SECONDS = 10
+STANDBY_CABIN_KEYWORDS = (
+    "候補客房",
+    "候补客房",
+    "standby stateroom",
+    "standby",
+)
 
 
 def ts() -> str:
@@ -285,6 +291,42 @@ def find_tier_for_name(cabin_name: str, tier_rules: list) -> int | None:
     return None
 
 
+def iter_cabin_name_candidates(item: dict) -> list[str]:
+    if not isinstance(item, dict):
+        return []
+    candidates = []
+    seen = set()
+    for key in (
+        "traditional_chinese_cabin_name",
+        "simplified_chinese_cabin_name",
+        "cabin_name",
+        "cabin_category_name",
+    ):
+        value = item.get(key)
+        if not isinstance(value, str):
+            continue
+        text = value.strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        candidates.append(text)
+    return candidates
+
+
+def pick_display_cabin_name(item: dict) -> str:
+    for name in iter_cabin_name_candidates(item):
+        return name
+    return ""
+
+
+def is_standby_cabin_item(item: dict) -> bool:
+    for name in iter_cabin_name_candidates(item):
+        lowered = name.lower()
+        if any(keyword.lower() in lowered for keyword in STANDBY_CABIN_KEYWORDS):
+            return True
+    return False
+
+
 def to_int_or_none(value):
     try:
         return int(value)
@@ -479,10 +521,17 @@ def main():
                         continue
 
                     effective_http = 200 if any_http_200 else last_http
+                    last_seen_cabins = []
+                    for item in last_items:
+                        display_name = pick_display_cabin_name(item)
+                        if display_name:
+                            last_seen_cabins.append(display_name)
+                    has_standby = any(is_standby_cabin_item(x) for x in last_items if isinstance(x, dict))
                     update_fields = {
                         "last_check_at": ts(),
                         "last_http": effective_http,
-                        "last_seen_cabins": [x.get("cabin_name") for x in last_items if x.get("cabin_name")],
+                        "last_seen_cabins": last_seen_cabins,
+                        "last_seen_has_standby": has_standby,
                     }
 
                     if effective_http != 200:
@@ -539,6 +588,21 @@ def main():
                         notified_tiers.add(tier)
 
                     update_fields["notified_tiers"] = sorted(notified_tiers)
+                    notified_standby = bool(monitor.get("notified_standby"))
+                    if has_standby and not notified_standby:
+                        max_pax_value = to_int_or_none(update_fields.get("max_pax", monitor.get("max_pax")))
+                        payload = {
+                            "type": "CRUISE_STANDBY_AVAILABLE",
+                            "at": time.time(),
+                            "date": monitor.get("departure_date") or monitor.get("date") or "",
+                            "port_name": monitor.get("port_name") or "",
+                            "itinerary_name": monitor.get("itinerary_name") or "",
+                            "max_pax": max_pax_value,
+                            "cabin_name": "候補客房",
+                        }
+                        notify(payload)
+                        notified_standby = True
+                    update_fields["notified_standby"] = notified_standby
                     update_monitor_fields(monitor_key, update_fields)
                 except PermissionError:
                     raise

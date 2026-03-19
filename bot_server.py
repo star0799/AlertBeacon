@@ -106,7 +106,11 @@ _latest_tokens = {
 CRUISE_RELOGIN_NEEDED = False
 LAST_RELOGIN_ALERT_AT = 0.0
 LAST_RECOVER_ALERT_AT = 0.0
-CRUISE_AVAILABILITY_NOTIFY_TYPES = {"CRUISE_CABIN_AVAILABLE", "CRUISE_TIER_AVAILABLE"}
+CRUISE_AVAILABILITY_NOTIFY_TYPES = {
+    "CRUISE_CABIN_AVAILABLE",
+    "CRUISE_TIER_AVAILABLE",
+    "CRUISE_STANDBY_AVAILABLE",
+}
 
 
 def _resolve_cruise_notify_target(event_type: str) -> tuple[LineBotApi | None, str, str]:
@@ -766,6 +770,21 @@ def cruise_notify():
             f"出發：{port_name}\n"
             f"航程：{itinerary_name}\n"
             f"房型：{tier_full}"
+        )
+
+    elif t == "CRUISE_STANDBY_AVAILABLE":
+        date = data.get("date") or ""
+        port_name = data.get("port_name") or ""
+        itinerary_name = data.get("itinerary_name") or ""
+        max_pax = data.get("max_pax")
+        max_pax_text = f"（{max_pax}人）" if isinstance(max_pax, int) and max_pax > 0 else ""
+
+        text = (
+            f"郵輪【查到可訂房】候補客房{max_pax_text}\n"
+            f"日期：{date}\n"
+            f"出發：{port_name}\n"
+            f"航程：{itinerary_name}\n"
+            "房型：候補客房"
         )
 
     elif t == "CRUISE_NEED_RELOGIN":
@@ -4366,8 +4385,11 @@ def handle_cruise_message(event):
             last_check = m.get("last_check_at") or "尚未檢查"
 
             tiers = m.get("last_seen_tiers") or []
-            if tiers:
-                tiers_txt = "/".join(tier_name(t) for t in tiers)
+            room_types = [tier_name(t) for t in tiers]
+            if m.get("last_seen_has_standby"):
+                room_types.append("候補客房")
+            if room_types:
+                tiers_txt = "/".join(room_types)
             else:
                 tiers_txt = "目前無房"
 
@@ -4498,6 +4520,8 @@ def handle_cruise_message(event):
                 m["notified_tiers"] = []
                 m["enabled"] = True
                 m["no_room_until_epoch"] = 0
+                m.setdefault("last_seen_has_standby", False)
+                m.setdefault("notified_standby", False)
                 result["updated"] = True
                 return
 
@@ -4517,6 +4541,8 @@ def handle_cruise_message(event):
             "last_seen_cabins": [],
             "last_seen_tiers": [],
             "notified_tiers": [],
+            "last_seen_has_standby": False,
+            "notified_standby": False,
             "no_room_until_epoch": 0,
         })
         result["added"] = True
