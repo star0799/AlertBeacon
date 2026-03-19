@@ -4387,7 +4387,7 @@ def handle_cruise_message(event):
             tiers = m.get("last_seen_tiers") or []
             room_types = [tier_name(t) for t in tiers]
             if m.get("last_seen_has_standby"):
-                room_types.append("候補客房")
+                room_types.insert(0, "候補")
             if room_types:
                 tiers_txt = "/".join(room_types)
             else:
