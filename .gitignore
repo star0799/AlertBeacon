@@ -14,6 +14,7 @@ state/
 state/
 .vscode
 users_cruise.*
+users_cruise_log.json
 monitors_cruise.json
 __pycache__/
 .venv/

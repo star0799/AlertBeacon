@@ -820,7 +820,10 @@ def cruise_notify():
         except Exception as e:
             errors.append({"user": uid, "error": str(e)})
 
-    return jsonify({"ok": True, "sent": ok_count, "errors": errors, "channel": channel_label})
+    result = {"ok": ok_count > 0, "sent": ok_count, "errors": errors, "channel": channel_label}
+    if ok_count <= 0:
+        return jsonify(result), 503
+    return jsonify(result)
 
 @app.post("/cruise/test_push")
 def cruise_test_push():

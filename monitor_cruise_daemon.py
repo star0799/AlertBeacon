@@ -20,6 +20,11 @@ TIER_RULES_FILE = os.path.join(BASE_DIR, "cabin_name")
 FEATURES_FILE = os.path.join(BASE_DIR, "features.json")
 NO_ROOM_COOLDOWN_SECONDS = 0
 FEATURE_CHECK_SECONDS = 10
+CRUISE_AVAILABILITY_NOTIFY_TYPES = {
+    "CRUISE_CABIN_AVAILABLE",
+    "CRUISE_TIER_AVAILABLE",
+    "CRUISE_STANDBY_AVAILABLE",
+}
 STANDBY_CABIN_KEYWORDS = (
     "候補客房",
     "候补客房",
@@ -32,9 +37,78 @@ def ts() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
+class NotifyDeliveryFailed(Exception):
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _notify_response_detail(response: requests.Response) -> str:
+    parts = [f"status={response.status_code}"]
+    try:
+        data = response.json() or {}
+    except Exception:
+        data = {}
+
+    if isinstance(data, dict):
+        if "sent" in data:
+            parts.append(f"sent={data.get('sent')}")
+        error = data.get("error")
+        if error:
+            parts.append(f"error={error}")
+        errors = data.get("errors")
+        if isinstance(errors, list) and errors:
+            sample = errors[0]
+            if isinstance(sample, dict):
+                sample_text = ", ".join(
+                    f"{k}={sample.get(k)}" for k in ("user", "error") if sample.get(k)
+                )
+            else:
+                sample_text = str(sample)
+            if sample_text:
+                parts.append(f"sample_error={sample_text}")
+
+    body = _body_head(getattr(response, "text", "") or "")
+    if body:
+        parts.append(f"body_head={body}")
+    return " ".join(parts)
+
+
 def notify(payload: dict) -> None:
-    r = requests.post(f"{BOT}/cruise/notify", json=payload, timeout=10)
-    r.raise_for_status()
+    try:
+        r = requests.post(f"{BOT}/cruise/notify", json=payload, timeout=10)
+    except requests.RequestException as ex:
+        raise NotifyDeliveryFailed(
+            f"/cruise/notify request failed: {type(ex).__name__}: {str(ex)[:200]}"
+        ) from ex
+
+    if not r.ok:
+        raise NotifyDeliveryFailed(
+            f"/cruise/notify failed {_notify_response_detail(r)}",
+            status_code=r.status_code,
+        )
+
+    try:
+        data = r.json() or {}
+    except Exception:
+        data = {}
+
+    if isinstance(data, dict):
+        if data.get("ok") is False:
+            raise NotifyDeliveryFailed(
+                f"/cruise/notify returned ok=false {_notify_response_detail(r)}",
+                status_code=r.status_code,
+            )
+        sent = data.get("sent")
+        if (
+            payload.get("type") in CRUISE_AVAILABILITY_NOTIFY_TYPES
+            and isinstance(sent, int)
+            and sent <= 0
+        ):
+            raise NotifyDeliveryFailed(
+                f"/cruise/notify sent=0 {_notify_response_detail(r)}",
+                status_code=r.status_code,
+            )
 
 
 def get_tokens() -> tuple[dict | None, str, str]:
@@ -469,6 +543,12 @@ def main():
                     continue
 
                 monitor_key = make_monitor_key(monitor)
+                update_fields = None
+                notified_tiers = {
+                    to_int_or_none(x) for x in (monitor.get("notified_tiers") or [])
+                }
+                notified_tiers.discard(None)
+                notified_standby = bool(monitor.get("notified_standby"))
                 try:
                     now = time.time()
                     max_pax = to_int_or_none(monitor.get("max_pax"))
@@ -557,10 +637,9 @@ def main():
                         update_fields["no_room_until_epoch"] = 0
 
                     present_tiers = set(update_fields["last_seen_tiers"])
-                    notified_tiers = {
-                        to_int_or_none(x) for x in (monitor.get("notified_tiers") or [])
-                    }
-                    notified_tiers.discard(None)
+                    # Only suppress alerts for tiers that are still present.
+                    # If a tier disappears and later comes back, alert again.
+                    notified_tiers &= present_tiers
                     new_tiers = present_tiers - notified_tiers
                     notify_mode = monitor.get("notify_mode", "per_tier_first_seen")
                     baseline_tier = to_int_or_none(monitor.get("baseline_tier"))
@@ -588,7 +667,8 @@ def main():
                         notified_tiers.add(tier)
 
                     update_fields["notified_tiers"] = sorted(notified_tiers)
-                    notified_standby = bool(monitor.get("notified_standby"))
+                    if not has_standby:
+                        notified_standby = False
                     if has_standby and not notified_standby:
                         max_pax_value = to_int_or_none(update_fields.get("max_pax", monitor.get("max_pax")))
                         payload = {
@@ -608,6 +688,13 @@ def main():
                     raise
                 except RefreshTempFailed:
                     raise
+                except NotifyDeliveryFailed as ex:
+                    if isinstance(update_fields, dict):
+                        update_fields["notified_tiers"] = sorted(notified_tiers)
+                        update_fields["notified_standby"] = notified_standby
+                        update_monitor_fields(monitor_key, update_fields)
+                    print(f"[{ts()}] [DAEMON] notify delivery failed key={monitor_key}:", repr(ex), flush=True)
+                    continue
                 except requests.HTTPError as ex:
                     code = getattr(ex.response, "status_code", None)
                     update_monitor_fields(monitor_key, {
