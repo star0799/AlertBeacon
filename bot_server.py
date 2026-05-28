@@ -24,6 +24,25 @@ PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip()
 app = Flask(__name__)
 app.json.ensure_ascii = False
 
+PAYMENT_FOR_PORT_CHARGE = "Port Charge"
+PAYMENT_FOR_NON_MEMBER_SURCHARGE = "Non Member Surcharge"
+PAYMENT_FOR_GRATUITY_CHARGE = "Gratuity Charge"
+PAYMENT_FOR_VALUES = {
+    PAYMENT_FOR_PORT_CHARGE,
+    PAYMENT_FOR_NON_MEMBER_SURCHARGE,
+    PAYMENT_FOR_GRATUITY_CHARGE,
+}
+PAYMENT_FOR_ALIASES = {
+    "port_charge": PAYMENT_FOR_PORT_CHARGE,
+    "port": PAYMENT_FOR_PORT_CHARGE,
+    "non_member_surcharge": PAYMENT_FOR_NON_MEMBER_SURCHARGE,
+    "surcharge": PAYMENT_FOR_NON_MEMBER_SURCHARGE,
+    "gratuity_charge": PAYMENT_FOR_GRATUITY_CHARGE,
+    "gratuity": PAYMENT_FOR_GRATUITY_CHARGE,
+    "service_fee": PAYMENT_FOR_GRATUITY_CHARGE,
+    "service_charge": PAYMENT_FOR_GRATUITY_CHARGE,
+}
+
 
 @app.get("/health")
 def health():
@@ -261,12 +280,8 @@ def cruise_pay(code: str):
             "rwcc_points": "RWCC Points",
             "genting_points": "Genting Points",
         }
-        payment_for_map = {
-            "port_charge": "Port Charge",
-            "non_member_surcharge": "Non Member Surcharge",
-        }
         allowed_methods = set(method_map.values())
-        allowed_payment_for = set(payment_for_map.values())
+        allowed_payment_for = set(PAYMENT_FOR_VALUES)
 
         def normalize_method(value):
             if value in method_map:
@@ -276,11 +291,7 @@ def cruise_pay(code: str):
             return None
 
         def normalize_payment_for(value):
-            if value in payment_for_map:
-                return payment_for_map[value]
-            if value in allowed_payment_for:
-                return value
-            return None
+            return _normalize_payment_for_label(value)
 
         raw_items = payment_method
         if isinstance(raw_items, str):
@@ -294,7 +305,7 @@ def cruise_pay(code: str):
         for item in raw_items:
             if not isinstance(item, dict):
                 continue
-            raw_for = item.get("payment_for") or "Port Charge"
+            raw_for = item.get("payment_for") or PAYMENT_FOR_PORT_CHARGE
             raw_method = item.get("payment_method")
             mapped_method = normalize_method(raw_method)
             if isinstance(raw_for, list):
@@ -364,8 +375,25 @@ def cruise_pay(code: str):
             if not record_updated_time:
                 return jsonify({"ok": False, "error": "missing recordUpdatedTime (cannot refresh)"}), 400
 
+        if _summary_has_payable_gratuity(summary):
+            has_gratuity = any(item.get("payment_for") == PAYMENT_FOR_GRATUITY_CHARGE for item in normalized_items)
+            if not has_gratuity:
+                port_credit_card_item = next(
+                    (
+                        item for item in normalized_items
+                        if item.get("payment_for") == PAYMENT_FOR_PORT_CHARGE
+                        and item.get("payment_method") == "Credit Card"
+                    ),
+                    None,
+                )
+                if port_credit_card_item:
+                    normalized_items.append({
+                        "payment_for": PAYMENT_FOR_GRATUITY_CHARGE,
+                        "payment_method": port_credit_card_item.get("payment_method"),
+                    })
+
         # ----- pay precheck for surcharge (before payment) -----
-        has_surcharge = any(item.get("payment_for") == "Non Member Surcharge" for item in normalized_items)
+        has_surcharge = any(item.get("payment_for") == PAYMENT_FOR_NON_MEMBER_SURCHARGE for item in normalized_items)
         if has_surcharge:
             passenger_list = []
             if isinstance(summary, dict):
@@ -428,11 +456,17 @@ def cruise_pay(code: str):
         return (s or "").strip().lower().replace("_", " ")
 
     items_to_payment = []
+    has_port_charge = False
+    seen_payment_items = set()
     for item in normalized_items:
         if _norm_payment_for(item.get("payment_for")) == "port charge":
-            items_to_payment = [item]
-            break
-    if not items_to_payment:
+            has_port_charge = True
+        key = (item.get("payment_for"), item.get("payment_method"))
+        if key in seen_payment_items:
+            continue
+        seen_payment_items.add(key)
+        items_to_payment.append(item)
+    if not has_port_charge:
         return jsonify({"ok": False, "error": "missing Port Charge payment item"}), 400
 
     print(
@@ -1398,6 +1432,11 @@ def _fmt_field(value) -> str:
 def _fmt_amount(value) -> str:
     if value is None:
         return ""
+    if isinstance(value, Decimal):
+        text = format(value.normalize(), "f")
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        return text or "0"
     if isinstance(value, (int, float)):
         if isinstance(value, float) and value.is_integer():
             return str(int(value))
@@ -1405,6 +1444,139 @@ def _fmt_amount(value) -> str:
     if isinstance(value, str):
         return value.strip()
     return ""
+
+
+def _amount_decimal(value) -> Decimal | None:
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return value
+    try:
+        text = str(value).strip().replace(",", "")
+        if not text:
+            return None
+        return Decimal(text)
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _payment_status_is_paid(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    return value.strip().lower() in {"paid", "success", "succeeded", "completed"}
+
+
+def _normalize_payment_for_label(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text in PAYMENT_FOR_VALUES:
+        return text
+    key = text.lower().replace("-", "_").replace(" ", "_")
+    return PAYMENT_FOR_ALIASES.get(key)
+
+
+def _summary_port_credit_card_amount(summary: dict) -> Decimal | None:
+    if not isinstance(summary, dict):
+        return None
+    pcm = summary.get("port_charge_mode")
+    if isinstance(pcm, dict):
+        amount = _amount_decimal(pcm.get("credit_card"))
+        if amount is not None:
+            return amount
+    return _amount_decimal(summary.get("credit_card"))
+
+
+def _summary_gratuity_credit_card_amount(summary: dict) -> Decimal | None:
+    if not isinstance(summary, dict):
+        return None
+    mode = summary.get("gratuity_charge_mode")
+    if isinstance(mode, list):
+        total = Decimal("0")
+        found = False
+        for item in mode:
+            if not isinstance(item, dict) or item.get("is_config_free") is True:
+                continue
+            amount = _amount_decimal(item.get("credit_card_amount"))
+            if amount is None:
+                amount = _amount_decimal(item.get("amount"))
+            if amount is not None:
+                total += amount
+                found = True
+        if found:
+            return total
+    if isinstance(mode, dict):
+        amount = _amount_decimal(mode.get("credit_card_amount"))
+        if amount is None:
+            amount = _amount_decimal(mode.get("credit_card"))
+        if amount is not None:
+            return amount
+    return _amount_decimal(summary.get("gratuity_charge_amount"))
+
+
+def _summary_non_member_surcharge_credit_card_amount(summary: dict) -> Decimal | None:
+    if not isinstance(summary, dict):
+        return None
+    summary_by_method = summary.get("non_member_surcharge_summary")
+    if isinstance(summary_by_method, dict):
+        amount = _amount_decimal(summary_by_method.get("credit_card"))
+        if amount is not None:
+            return amount
+    mode = summary.get("non_member_surcharge_mode")
+    if isinstance(mode, list):
+        total = Decimal("0")
+        found = False
+        for item in mode:
+            if not isinstance(item, dict):
+                continue
+            amount = _amount_decimal(item.get("credit_card_amount"))
+            if amount is None:
+                amount = _amount_decimal(item.get("amount"))
+            if amount is not None:
+                total += amount
+                found = True
+        if found:
+            return total
+    if isinstance(mode, dict):
+        amount = _amount_decimal(mode.get("credit_card_amount"))
+        if amount is None:
+            amount = _amount_decimal(mode.get("credit_card"))
+        if amount is not None:
+            return amount
+    return _amount_decimal(summary.get("non_member_surcharge_amount"))
+
+
+def _summary_has_payable_gratuity(summary: dict | None) -> bool:
+    if not isinstance(summary, dict):
+        return False
+    if _payment_status_is_paid(summary.get("gratuity_charge_status")):
+        return False
+    amount = _summary_gratuity_credit_card_amount(summary)
+    return amount is not None and amount > 0
+
+
+def _summary_credit_card_total_amount(summary: dict) -> Decimal | None:
+    if not isinstance(summary, dict):
+        return None
+    amounts = []
+    if not _payment_status_is_paid(summary.get("port_charge_status")):
+        port_amount = _summary_port_credit_card_amount(summary)
+        if port_amount is not None and port_amount > 0:
+            amounts.append(port_amount)
+    if _summary_has_payable_gratuity(summary):
+        gratuity_amount = _summary_gratuity_credit_card_amount(summary)
+        if gratuity_amount is not None and gratuity_amount > 0:
+            amounts.append(gratuity_amount)
+    surcharge_status = summary.get("non_member_surcharge_card_status") or summary.get("non_member_surcharge_status")
+    if not _payment_status_is_paid(surcharge_status):
+        surcharge_amount = _summary_non_member_surcharge_credit_card_amount(summary)
+        if surcharge_amount is not None and surcharge_amount > 0:
+            amounts.append(surcharge_amount)
+    if not amounts:
+        return None
+    return sum(amounts, Decimal("0"))
 
 
 def _full_name(person: dict) -> str:
@@ -1487,12 +1659,13 @@ def build_paylink_summary_text(
     cabin_name = summary.get("traditional_chinese_cabin_name") or ""
     pax = summary.get("design_pax") or summary.get("customer_pax")
 
-    amount = ""
-    pcm = summary.get("port_charge_mode")
-    if isinstance(pcm, dict):
-        amount = _fmt_amount(pcm.get("credit_card"))
+    amount = _fmt_amount(_summary_credit_card_total_amount(summary))
     if not amount:
-        amount = _fmt_amount(summary.get("credit_card"))
+        pcm = summary.get("port_charge_mode")
+        if isinstance(pcm, dict):
+            amount = _fmt_amount(pcm.get("credit_card"))
+        if not amount:
+            amount = _fmt_amount(summary.get("credit_card"))
 
     def _get_person_value(person: dict, aliases: list[str]):
         if not isinstance(person, dict):
@@ -1709,45 +1882,62 @@ def _normalize_payment_method(value) -> list | None:
     if isinstance(value, dict):
         return [value]
     if isinstance(value, str) and value.strip():
-        return [{"payment_for": "Port Charge", "payment_method": value.strip()}]
+        return [{"payment_for": PAYMENT_FOR_PORT_CHARGE, "payment_method": value.strip()}]
     return None
 
 
-def _build_payment_items(method_value, include_surcharge: bool) -> list | None:
+def _build_payment_items(
+    method_value,
+    include_surcharge: bool,
+    include_gratuity: bool = False,
+) -> list | None:
     items = _normalize_payment_method(method_value)
     if not items:
         return None
     normalized = []
     has_port_charge = False
     has_surcharge = False
+    has_gratuity = False
     for item in items:
         if not isinstance(item, dict):
             return None
         entry = dict(item)
         if not entry.get("payment_for"):
-            entry["payment_for"] = "Port Charge"
+            entry["payment_for"] = PAYMENT_FOR_PORT_CHARGE
+        mapped_for = _normalize_payment_for_label(entry.get("payment_for"))
+        if mapped_for:
+            entry["payment_for"] = mapped_for
         if not entry.get("payment_method"):
             return None
-        if entry.get("payment_for") == "Port Charge":
+        if entry.get("payment_for") == PAYMENT_FOR_PORT_CHARGE:
             has_port_charge = True
-        if entry.get("payment_for") == "Non Member Surcharge":
+        if entry.get("payment_for") == PAYMENT_FOR_NON_MEMBER_SURCHARGE:
             has_surcharge = True
+        if entry.get("payment_for") == PAYMENT_FOR_GRATUITY_CHARGE:
+            has_gratuity = True
         normalized.append(entry)
     if not normalized:
         return None
     if not has_port_charge:
         normalized.insert(0, {
-            "payment_for": "Port Charge",
+            "payment_for": PAYMENT_FOR_PORT_CHARGE,
             "payment_method": normalized[0].get("payment_method"),
         })
     if include_surcharge:
         if not has_surcharge:
             normalized.append({
-                "payment_for": "Non Member Surcharge",
+                "payment_for": PAYMENT_FOR_NON_MEMBER_SURCHARGE,
                 "payment_method": normalized[0].get("payment_method"),
             })
     else:
-        normalized = [item for item in normalized if item.get("payment_for") != "Non Member Surcharge"]
+        normalized = [item for item in normalized if item.get("payment_for") != PAYMENT_FOR_NON_MEMBER_SURCHARGE]
+    if include_gratuity and not has_gratuity:
+        normalized.append({
+            "payment_for": PAYMENT_FOR_GRATUITY_CHARGE,
+            "payment_method": normalized[0].get("payment_method"),
+        })
+    elif not include_gratuity:
+        normalized = [item for item in normalized if item.get("payment_for") != PAYMENT_FOR_GRATUITY_CHARGE]
     return normalized
 
 
@@ -1872,7 +2062,11 @@ def _create_credit_card_paylink_for_booking(
     ttl_seconds: int,
     booking_summary: dict | None,
 ) -> tuple[dict, int]:
-    payment_method = _build_payment_items("credit_card", include_surcharge=False)
+    payment_method = _build_payment_items(
+        "credit_card",
+        include_surcharge=False,
+        include_gratuity=_summary_has_payable_gratuity(booking_summary),
+    )
     if not payment_method:
         return {"ok": False, "error": "invalid payment_method"}, 400
     paylink_entry = create_paylink_entry(
@@ -1915,7 +2109,7 @@ def _pay_port_charge_with_rwcc(
 
     body = {
         "booking_id": booking_id,
-        "payment_method": [item for item in payment_method if item.get("payment_for") == "Port Charge"],
+        "payment_method": [item for item in payment_method if item.get("payment_for") == PAYMENT_FOR_PORT_CHARGE],
         "recordUpdatedTime": record_updated_time,
     }
     url = f"{CRUISE_BACKEND_BASE}/customers/v2/booking/payment/{booking_id}"
@@ -2075,6 +2269,7 @@ def _book_and_paylink_flow(data: dict, base_url: str, trace_id: str) -> tuple[di
     customer_pax = to_int(data.get("customer_pax"))
     itinerary_id = to_int(data.get("itinerary_id"))
     non_member_surcharge_id = to_int_or_none(data.get("non_member_surcharge_id"))
+    gratuity_charge_id = to_int_or_none(data.get("gratuity_charge_id") or data.get("gratuityChargeId"))
     record_updated_time = data.get("record_updated_time") or data.get("recordUpdatedTime")
 
     missing = []
@@ -2103,7 +2298,7 @@ def _book_and_paylink_flow(data: dict, base_url: str, trace_id: str) -> tuple[di
     draft_payload = {
         "cabin_allotment_id": cabin_allotment_id,
         "customer_pax": customer_pax,
-        "gratuity_charge_id": None,
+        "gratuity_charge_id": gratuity_charge_id,
         "itinerary_id": itinerary_id,
         "record_updated_time": record_updated_time,
         "non_member_surcharge_id": non_member_surcharge_id,
@@ -2189,10 +2384,18 @@ def _book_and_paylink_flow(data: dict, base_url: str, trace_id: str) -> tuple[di
             print(f"[{ts()}] [CRUISE] trace={trace_id} missing recordUpdatedTime", flush=True)
             return {"ok": False, "error": "後端缺少 recordUpdatedTime"}, 502
 
+        payment_method_for_link = _build_payment_items(
+            payment_method,
+            include_surcharge=non_member_surcharge_id is not None,
+            include_gratuity=_summary_has_payable_gratuity(booking_summary),
+        )
+        if not payment_method_for_link:
+            return {"ok": False, "error": "invalid payment_method"}, 400
+
         paylink_entry = create_paylink_entry(
             booking_id=numeric_id,
             record_updated_time=latest_record_updated_time,
-            payment_method=payment_method,
+            payment_method=payment_method_for_link,
             ttl_seconds=ttl_seconds,
         )
         if not paylink_entry:
@@ -2889,6 +3092,7 @@ def _resolve_allotment(access_token: str, date: str, tier: int, pax: int) -> tup
         "cabin_allotment_id": picked.get("cabin_allotment_id") or picked.get("id"),
         "itinerary_id": (data.get("itinerary_id") or data.get("itineraryId")) if isinstance(data, dict) else None,
         "non_member_surcharge_id": (data.get("non_member_surcharge_id") or data.get("nonMemberSurchargeId")) if isinstance(data, dict) else None,
+        "gratuity_charge_id": (data.get("gratuity_charge_id") or data.get("gratuityChargeId")) if isinstance(data, dict) else None,
         "record_updated_time": picked.get("recordUpdatedTime") or picked.get("record_updated_time") or data.get("recordUpdatedTime"),
         "itinerary_name": itinerary_name,
         "port_name": port_info.get("port_name") or "",
@@ -2897,6 +3101,8 @@ def _resolve_allotment(access_token: str, date: str, tier: int, pax: int) -> tup
         result["itinerary_id"] = picked.get("itinerary_id") or picked.get("itineraryId")
     if not result["non_member_surcharge_id"]:
         result["non_member_surcharge_id"] = picked.get("non_member_surcharge_id") or picked.get("nonMemberSurchargeId")
+    if not result["gratuity_charge_id"]:
+        result["gratuity_charge_id"] = picked.get("gratuity_charge_id") or picked.get("gratuityChargeId")
     missing = []
     if not result["cabin_allotment_id"]:
         missing.append("cabin_allotment_id")
@@ -3487,18 +3693,25 @@ def _book_and_paylink_with_people(
     cabin_allotment_id = int(allotment.get("cabin_allotment_id") or 0)
     itinerary_id = int(allotment.get("itinerary_id") or 0)
     non_member_surcharge_id = allotment.get("non_member_surcharge_id")
+    gratuity_charge_id = allotment.get("gratuity_charge_id")
     try:
         non_member_surcharge_id = int(non_member_surcharge_id)
     except Exception:
         non_member_surcharge_id = None
     if non_member_surcharge_id is not None and non_member_surcharge_id <= 0:
         non_member_surcharge_id = None
+    try:
+        gratuity_charge_id = int(gratuity_charge_id)
+    except Exception:
+        gratuity_charge_id = None
+    if gratuity_charge_id is not None and gratuity_charge_id <= 0:
+        gratuity_charge_id = None
     record_updated_time = _ensure_record_updated_time(None)
 
     draft_payload = {
         "cabin_allotment_id": cabin_allotment_id,
         "customer_pax": pax,
-        "gratuity_charge_id": None,
+        "gratuity_charge_id": gratuity_charge_id,
         "itinerary_id": itinerary_id,
         "record_updated_time": record_updated_time,
     }
