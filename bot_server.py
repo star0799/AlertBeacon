@@ -27,16 +27,24 @@ app.json.ensure_ascii = False
 PAYMENT_FOR_PORT_CHARGE = "Port Charge"
 PAYMENT_FOR_NON_MEMBER_SURCHARGE = "Non Member Surcharge"
 PAYMENT_FOR_GRATUITY_CHARGE = "Gratuity Charge"
+PAYMENT_FOR_AMENDMENT_CHARGE = "Amendment Charge"
 PAYMENT_FOR_VALUES = {
     PAYMENT_FOR_PORT_CHARGE,
     PAYMENT_FOR_NON_MEMBER_SURCHARGE,
     PAYMENT_FOR_GRATUITY_CHARGE,
+}
+PAYMENT_FOR_BACKEND_VALUES = {
+    PAYMENT_FOR_PORT_CHARGE,
+    PAYMENT_FOR_NON_MEMBER_SURCHARGE,
+    PAYMENT_FOR_AMENDMENT_CHARGE,
 }
 PAYMENT_FOR_ALIASES = {
     "port_charge": PAYMENT_FOR_PORT_CHARGE,
     "port": PAYMENT_FOR_PORT_CHARGE,
     "non_member_surcharge": PAYMENT_FOR_NON_MEMBER_SURCHARGE,
     "surcharge": PAYMENT_FOR_NON_MEMBER_SURCHARGE,
+    "amendment_charge": PAYMENT_FOR_AMENDMENT_CHARGE,
+    "amendment": PAYMENT_FOR_AMENDMENT_CHARGE,
     "gratuity_charge": PAYMENT_FOR_GRATUITY_CHARGE,
     "gratuity": PAYMENT_FOR_GRATUITY_CHARGE,
     "service_fee": PAYMENT_FOR_GRATUITY_CHARGE,
@@ -375,22 +383,20 @@ def cruise_pay(code: str):
             if not record_updated_time:
                 return jsonify({"ok": False, "error": "missing recordUpdatedTime (cannot refresh)"}), 400
 
-        if _summary_has_payable_gratuity(summary):
-            has_gratuity = any(item.get("payment_for") == PAYMENT_FOR_GRATUITY_CHARGE for item in normalized_items)
-            if not has_gratuity:
-                port_credit_card_item = next(
-                    (
-                        item for item in normalized_items
-                        if item.get("payment_for") == PAYMENT_FOR_PORT_CHARGE
-                        and item.get("payment_method") == "Credit Card"
-                    ),
-                    None,
-                )
-                if port_credit_card_item:
-                    normalized_items.append({
-                        "payment_for": PAYMENT_FOR_GRATUITY_CHARGE,
-                        "payment_method": port_credit_card_item.get("payment_method"),
-                    })
+        unsupported_items = [
+            item for item in normalized_items
+            if item.get("payment_for") not in PAYMENT_FOR_BACKEND_VALUES
+        ]
+        if unsupported_items:
+            print(
+                f"[{ts()}] [CRUISE] pay link dropping unsupported payment items: "
+                f"{unsupported_items} booking_id={booking_id}",
+                flush=True,
+            )
+            normalized_items = [
+                item for item in normalized_items
+                if item.get("payment_for") in PAYMENT_FOR_BACKEND_VALUES
+            ]
 
         # ----- pay precheck for surcharge (before payment) -----
         has_surcharge = any(item.get("payment_for") == PAYMENT_FOR_NON_MEMBER_SURCHARGE for item in normalized_items)
@@ -1560,7 +1566,7 @@ def _summary_has_payable_gratuity(summary: dict | None) -> bool:
     return amount is not None and amount > 0
 
 
-def _summary_credit_card_total_amount(summary: dict) -> Decimal | None:
+def _summary_credit_card_total_amount(summary: dict, include_gratuity: bool = True) -> Decimal | None:
     if not isinstance(summary, dict):
         return None
     amounts = []
@@ -1568,7 +1574,7 @@ def _summary_credit_card_total_amount(summary: dict) -> Decimal | None:
         port_amount = _summary_port_credit_card_amount(summary)
         if port_amount is not None and port_amount > 0:
             amounts.append(port_amount)
-    if _summary_has_payable_gratuity(summary):
+    if include_gratuity and _summary_has_payable_gratuity(summary):
         gratuity_amount = _summary_gratuity_credit_card_amount(summary)
         if gratuity_amount is not None and gratuity_amount > 0:
             amounts.append(gratuity_amount)
@@ -1662,7 +1668,7 @@ def build_paylink_summary_text(
     cabin_name = summary.get("traditional_chinese_cabin_name") or ""
     pax = summary.get("design_pax") or summary.get("customer_pax")
 
-    amount = _fmt_amount(_summary_credit_card_total_amount(summary))
+    amount = _fmt_amount(_summary_credit_card_total_amount(summary, include_gratuity=False))
     if not amount:
         pcm = summary.get("port_charge_mode")
         if isinstance(pcm, dict):
@@ -2068,7 +2074,7 @@ def _create_credit_card_paylink_for_booking(
     payment_method = _build_payment_items(
         "credit_card",
         include_surcharge=False,
-        include_gratuity=_summary_has_payable_gratuity(booking_summary),
+        include_gratuity=False,
     )
     if not payment_method:
         return {"ok": False, "error": "invalid payment_method"}, 400
@@ -2390,7 +2396,7 @@ def _book_and_paylink_flow(data: dict, base_url: str, trace_id: str) -> tuple[di
         payment_method_for_link = _build_payment_items(
             payment_method,
             include_surcharge=non_member_surcharge_id is not None,
-            include_gratuity=_summary_has_payable_gratuity(booking_summary),
+            include_gratuity=False,
         )
         if not payment_method_for_link:
             return {"ok": False, "error": "invalid payment_method"}, 400
