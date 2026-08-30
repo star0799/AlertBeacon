@@ -1,7 +1,14 @@
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError, LineBotApiError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from linebot.models import (
+    BubbleContainer,
+    FlexSendMessage,
+    MessageEvent,
+    PostbackEvent,
+    TextMessage,
+    TextSendMessage,
+)
 from flask import Flask, request, jsonify
 import base64
 import hashlib
@@ -14,11 +21,14 @@ import re
 import time
 import requests
 import secrets
+import threading
 from bs4 import BeautifulSoup
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from dotenv import load_dotenv
 from filelock import FileLock
+from urllib.parse import parse_qs, urlencode
 
 load_dotenv()
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip()
@@ -155,6 +165,7 @@ PENDING_RWCC_CONFIRM_TTL_SECONDS = 300
 CRUISE_ADMINS_FILE = os.path.join(STATE_DIR, "cruise_admins.json")
 PRIVATE_PEOPLE_FILE = os.path.join(STATE_DIR, "private_people.json")
 CRUISE_BACKEND_BASE = "https://backend-prd.b2m.stardreamcruises.com"
+ALL_CRUISE_SAILINGS_CACHE_TTL_SECONDS = 600
 
 _latest_recaptcha = {"token": None, "at": None, "action": None}
 _latest_tokens = {
@@ -168,6 +179,8 @@ _latest_tokens = {
 CRUISE_RELOGIN_NEEDED = False
 LAST_RELOGIN_ALERT_AT = 0.0
 LAST_RECOVER_ALERT_AT = 0.0
+_all_cruise_sailings_cache = {"at": 0.0, "items": []}
+_all_cruise_sailings_cache_lock = threading.Lock()
 CRUISE_AVAILABILITY_NOTIFY_TYPES = {
     "CRUISE_CABIN_AVAILABLE",
     "CRUISE_TIER_AVAILABLE",
@@ -4121,9 +4134,353 @@ def fetch_itinerary(access_token: str, date: str) -> str | None:
     return None
 
 
-def fetch_port(access_token: str, date: str) -> dict | None:
+def _request_cruise_list(access_token: str, path: str, params: dict):
+    url = f"{CRUISE_BACKEND_BASE}{path}"
+    response = request_cruise(
+        "GET",
+        url,
+        access_token=access_token,
+        headers_type="basic",
+        params=params,
+    )
+    if response.status_code in (401, 403):
+        raise PermissionError(f"{path} status={response.status_code}")
+    response.raise_for_status()
+    return response.json()
+
+
+def _fetch_cruise_itinerary_names(access_token: str) -> list[str]:
+    names = []
+    page = 1
+    total_pages = 1
+    while page <= total_pages:
+        payload = _request_cruise_list(
+            access_token,
+            "/customers/list/itinerary",
+            {"lang": "hant", "page": page},
+        ) or {}
+        items = payload.get("items") if isinstance(payload, dict) else []
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("traditional_chinese_name") or "").strip()
+            if "探索星號" in name and name not in names:
+                names.append(name)
+        meta = payload.get("meta") if isinstance(payload, dict) else {}
+        try:
+            total_pages = max(1, int((meta or {}).get("totalPages") or 1))
+        except (TypeError, ValueError):
+            total_pages = 1
+        page += 1
+    return names
+
+
+def _fetch_cruise_departure_dates(access_token: str, itinerary_name: str) -> list[str]:
+    payload = _request_cruise_list(
+        access_token,
+        "/customers/list/departure-date",
+        {"itinerary_name": itinerary_name, "lang": "hant"},
+    ) or []
+    if isinstance(payload, dict):
+        payload = payload.get("items") or []
+    return [str(value).strip() for value in payload if str(value).strip()]
+
+
+def _parse_cruise_itinerary_name(itinerary_name: str) -> dict | None:
+    cleaned_name = re.sub(r"^\[(?:單程|单程)\]\s*", "", (itinerary_name or "").strip())
+    parts = [part.strip() for part in cleaned_name.split(" - ") if part.strip()]
+    nights_index = None
+    nights = None
+    for index, part in enumerate(parts):
+        match = re.fullmatch(r"(\d+)\s*晚", part)
+        if match:
+            nights_index = index
+            nights = int(match.group(1))
+            break
+    if nights_index is None or nights is None or nights < 0:
+        return None
+
+    ship = " - ".join(parts[:nights_index]).strip() or "未標示船名"
+    destination_parts = []
+    for part in parts[nights_index + 1:]:
+        destination = re.sub(r"\s*海上遊\s*$", "", part).strip()
+        if destination:
+            destination_parts.append(destination)
+    destination_text = "、".join(destination_parts) or "未標示目的地"
+    return {
+        "ship": ship,
+        "destinations": destination_text,
+        "nights": nights,
+        "total_days": nights + 1,
+    }
+
+
+def fetch_all_cruise_sailings(
+    access_token: str,
+    today: date | None = None,
+    force_refresh: bool = False,
+) -> list[dict]:
+    today = today or datetime.now().date()
+    now = time.time()
+    with _all_cruise_sailings_cache_lock:
+        cache_age = now - float(_all_cruise_sailings_cache.get("at") or 0)
+        cached_items = _all_cruise_sailings_cache.get("items") or []
+        if not force_refresh and cached_items and cache_age < ALL_CRUISE_SAILINGS_CACHE_TTL_SECONDS:
+            return [item.copy() for item in cached_items if item.get("departure_date") >= today]
+
+    itinerary_names = _fetch_cruise_itinerary_names(access_token)
+    departures_by_itinerary = {}
+    worker_count = min(6, max(1, len(itinerary_names)))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = {
+            executor.submit(_fetch_cruise_departure_dates, access_token, name): name
+            for name in itinerary_names
+        }
+        for future in as_completed(futures):
+            itinerary_name = futures[future]
+            departures_by_itinerary[itinerary_name] = future.result()
+
+    sailings = []
+    seen = set()
+    for itinerary_name, departure_values in departures_by_itinerary.items():
+        parsed_itinerary = _parse_cruise_itinerary_name(itinerary_name)
+        if not parsed_itinerary:
+            print(
+                f"[{ts()}] [CRUISE] all sailings skipped unknown itinerary format={itinerary_name!r}",
+                flush=True,
+            )
+            continue
+        for departure_value in departure_values:
+            try:
+                departure_date = datetime.strptime(departure_value[:10], "%Y-%m-%d").date()
+            except (TypeError, ValueError):
+                continue
+            if departure_date < today:
+                continue
+            key = (departure_date, itinerary_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            total_days = parsed_itinerary["total_days"]
+            sailings.append({
+                "departure_date": departure_date,
+                "return_date": departure_date + timedelta(days=total_days - 1),
+                "itinerary_name": itinerary_name,
+                **parsed_itinerary,
+            })
+
+    sailings.sort(key=lambda item: (
+        item["departure_date"],
+        item["ship"],
+        item["destinations"],
+    ))
+    with _all_cruise_sailings_cache_lock:
+        _all_cruise_sailings_cache["at"] = time.time()
+        _all_cruise_sailings_cache["items"] = [item.copy() for item in sailings]
+    return sailings
+
+
+def _format_cruise_date(value: date) -> str:
+    weekday = "一二三四五六日"[value.weekday()]
+    return f"{value.year}年{value.month}月{value.day}日（星期{weekday}）"
+
+
+def format_all_cruise_sailings(sailings: list[dict]) -> str:
+    if not sailings:
+        return "今天以後目前沒有探索星號可預訂航程"
+    lines = [f"探索星號全部航程（今天以後，共 {len(sailings)} 個航次）"]
+    for index, sailing in enumerate(sailings, 1):
+        lines.extend([
+            "",
+            f"{index}. {sailing['ship']}｜{sailing['destinations']}",
+            (
+                f"{_format_cruise_date(sailing['departure_date'])} ～ "
+                f"{_format_cruise_date(sailing['return_date'])}"
+                f"（共{sailing['total_days']}天）"
+            ),
+        ])
+    return "\n".join(lines)
+
+
+def _cruise_sailing_action_id(sailing: dict) -> str:
+    departure_date = sailing.get("departure_date")
+    date_text = departure_date.isoformat() if isinstance(departure_date, date) else str(departure_date or "")
+    raw = f"{date_text}|{sailing.get('itinerary_name') or ''}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def build_all_cruise_flex_messages(sailings: list[dict], per_message: int = 8) -> list[FlexSendMessage]:
+    messages = []
+    total = len(sailings)
+    for start in range(0, total, per_message):
+        group = sailings[start:start + per_message]
+        rows = []
+        for sailing in group:
+            departure_date = sailing["departure_date"]
+            return_date = sailing["return_date"]
+            weekday = "一二三四五六日"[departure_date.weekday()]
+            return_weekday = "一二三四五六日"[return_date.weekday()]
+            action_data = urlencode({
+                "action": "monitor_sailing",
+                "date": departure_date.isoformat(),
+                "id": _cruise_sailing_action_id(sailing),
+            })
+            rows.append({
+                "type": "box",
+                "layout": "vertical",
+                "spacing": "xs",
+                "margin": "md",
+                "paddingAll": "12px",
+                "backgroundColor": "#F4F1EA",
+                "cornerRadius": "8px",
+                "action": {
+                    "type": "postback",
+                    "label": "加入監控",
+                    "data": action_data,
+                    "displayText": f"監控 {departure_date.isoformat()} {sailing['destinations']}",
+                },
+                "contents": [
+                    {
+                        "type": "text",
+                        "text": f"{departure_date.month}/{departure_date.day}（週{weekday}） {sailing['destinations']}",
+                        "weight": "bold",
+                        "size": "sm",
+                        "wrap": True,
+                        "color": "#173B35",
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            f"至 {return_date.month}/{return_date.day}（週{return_weekday}）"
+                            f"｜共{sailing['total_days']}天｜點擊監控"
+                        ),
+                        "size": "xs",
+                        "wrap": True,
+                        "color": "#5B665F",
+                    },
+                ],
+            })
+
+        end = start + len(group)
+        contents = BubbleContainer.new_from_json_dict({
+            "type": "bubble",
+            "size": "mega",
+            "header": {
+                "type": "box",
+                "layout": "vertical",
+                "backgroundColor": "#173B35",
+                "paddingAll": "16px",
+                "contents": [
+                    {
+                        "type": "text",
+                        "text": "探索星號全部航程",
+                        "weight": "bold",
+                        "size": "lg",
+                        "color": "#FFFFFF",
+                    },
+                    {
+                        "type": "text",
+                        "text": f"第 {start + 1}–{end} 筆，共 {total} 筆",
+                        "size": "xs",
+                        "color": "#D9E7E1",
+                        "margin": "sm",
+                    },
+                ],
+            },
+            "body": {
+                "type": "box",
+                "layout": "vertical",
+                "paddingAll": "12px",
+                "contents": rows,
+            },
+            "footer": {
+                "type": "box",
+                "layout": "vertical",
+                "paddingAll": "12px",
+                "contents": [{
+                    "type": "text",
+                    "text": "點擊航程後，以內艙規則監控 2人、4人",
+                    "size": "xs",
+                    "wrap": True,
+                    "align": "center",
+                    "color": "#6D756F",
+                }],
+            },
+        })
+        messages.append(FlexSendMessage(
+            alt_text=f"探索星號航程 {start + 1}-{end}，點擊可加入監控",
+            contents=contents,
+        ))
+    return messages
+
+
+def _send_line_message_batches(api, messages: list, reply_token: str, line_user_id: str) -> bool:
+    if not messages:
+        return False
+    try:
+        api.reply_message(reply_token, messages[:5])
+        for start in range(5, len(messages), 5):
+            api.push_message(line_user_id, messages[start:start + 5])
+        return True
+    except Exception as ex:
+        print(f"[{ts()}] [LINE] message batch failed: {ex!r}", flush=True)
+        return False
+
+
+def _upsert_default_cruise_monitor(date_text: str, itinerary_name: str, port_info: dict) -> str:
+    result = {"updated": False}
+
+    def _upsert(monitors_list):
+        for monitor in monitors_list:
+            if monitor.get("date") != date_text:
+                continue
+            monitor.update({
+                "enabled": True,
+                "lang": "hant",
+                "itinerary_name": itinerary_name,
+                "departure_port": port_info.get("departure_port"),
+                "port_code": port_info.get("port_code"),
+                "port_name": port_info.get("port_name") or "",
+                "baseline_tier": 1,
+                "notify_mode": "per_tier_first_seen",
+                "max_pax": None,
+                "notified_tiers": [],
+                "notified_standby": False,
+                "no_room_until_epoch": 0,
+            })
+            result["updated"] = True
+            return
+
+        monitors_list.append({
+            "date": date_text,
+            "enabled": True,
+            "lang": "hant",
+            "itinerary_name": itinerary_name,
+            "departure_port": port_info.get("departure_port"),
+            "port_code": port_info.get("port_code"),
+            "port_name": port_info.get("port_name") or "",
+            "baseline_tier": 1,
+            "notify_mode": "per_tier_first_seen",
+            "max_pax": None,
+            "last_check_at": None,
+            "last_http": None,
+            "last_seen_cabins": [],
+            "last_seen_tiers": [],
+            "notified_tiers": [],
+            "last_seen_has_standby": False,
+            "notified_standby": False,
+            "no_room_until_epoch": 0,
+        })
+
+    update_cruise_monitors(_upsert)
+    return "更新" if result["updated"] else "新增"
+
+
+def fetch_port(access_token: str, date: str, itinerary_name: str | None = None) -> dict | None:
     url = f"{CRUISE_BACKEND_BASE}/customers/list/port"
     params = {"departure_date": date, "lang": "hant", "page": 1}
+    if itinerary_name:
+        params["itinerary_name"] = itinerary_name
     r = request_cruise("GET", url, access_token=access_token, headers_type="basic", params=params)
     if _handle_unauthorized(r.status_code, "fetch_port", f"status={r.status_code}", notify_mode="action_fail"):
         return None
@@ -4533,6 +4890,86 @@ if cruise_log_handler:
         add_cruise_log_user(user_id)
 
 
+@cruise_handler.add(PostbackEvent)
+def handle_cruise_postback(event):
+    values = parse_qs(event.postback.data or "")
+    if (values.get("action") or [""])[0] != "monitor_sailing":
+        return
+
+    user_id = event.source.user_id
+    add_cruise_user(user_id)
+    if not feature_enabled("cruise_daemon"):
+        cruise_line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="Cruise 功能目前停用"),
+        )
+        return
+
+    date_text = (values.get("date") or [""])[0]
+    sailing_id = (values.get("id") or [""])[0]
+    try:
+        departure_date = datetime.strptime(date_text, "%Y-%m-%d").date()
+    except ValueError:
+        departure_date = None
+    if not departure_date or departure_date < datetime.now().date() or not sailing_id:
+        cruise_line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="這個航程按鈕已失效，請重新傳送「全部航程」"),
+        )
+        return
+
+    access = get_latest_access_token()
+    access_meta = _token_metadata(access)
+    if not access or access_meta.get("seconds_until_expiry", 0) <= 30:
+        refreshed, _ = refresh_access_token("monitor_sailing_postback")
+        if not refreshed:
+            cruise_line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="Cruise 需要重新登入一次，請先重連網站"),
+            )
+            return
+        access = get_latest_access_token()
+
+    try:
+        sailings = fetch_all_cruise_sailings(access)
+        sailing = next(
+            (
+                item for item in sailings
+                if item.get("departure_date") == departure_date
+                and _cruise_sailing_action_id(item) == sailing_id
+            ),
+            None,
+        )
+        if not sailing:
+            cruise_line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="找不到這個航程，請重新傳送「全部航程」"),
+            )
+            return
+        port_info = fetch_port(access, date_text, sailing["itinerary_name"])
+        if not port_info or port_info.get("departure_port") is None:
+            raise ValueError("missing departure port")
+        status = _upsert_default_cruise_monitor(
+            date_text,
+            sailing["itinerary_name"],
+            port_info,
+        )
+    except PermissionError:
+        reply = "Cruise 需要重新登入一次，請先重連網站"
+    except Exception as ex:
+        print(f"[{ts()}] [CRUISE] monitor sailing postback failed: {ex!r}", flush=True)
+        reply = "新增航程監控失敗，請稍後再試"
+    else:
+        reply = (
+            f"✅ 已{status}監控\n"
+            f"日期：{date_text}\n"
+            f"目的地：{sailing['destinations']}\n"
+            "房型：內艙起始規則\n"
+            "人數：2人、4人"
+        )
+    cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+
+
 @cruise_handler.add(MessageEvent, message=TextMessage)
 def handle_cruise_message(event):
     user_id = event.source.user_id
@@ -4732,6 +5169,59 @@ def handle_cruise_message(event):
         reply = _build_customer_points_text(report)
         cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
+    if raw_text == "全部航程":
+        access = get_latest_access_token()
+        if not access:
+            reply = "請先手動登入一次讓 Token Sync 回灌"
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
+
+        access_meta = _token_metadata(access)
+        if access_meta.get("seconds_until_expiry", 60) <= 30:
+            refreshed, _ = refresh_access_token("all_sailings")
+            if not refreshed:
+                reply = "Cruise 需要重新登入一次，請先重連網站"
+                cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+                return
+            access = get_latest_access_token()
+
+        try:
+            sailings = fetch_all_cruise_sailings(access)
+        except PermissionError:
+            refreshed, _ = refresh_access_token("all_sailings_unauthorized")
+            if not refreshed:
+                reply = "Cruise 需要重新登入一次，請先重連網站"
+                cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+                return
+            try:
+                sailings = fetch_all_cruise_sailings(
+                    get_latest_access_token(),
+                    force_refresh=True,
+                )
+            except Exception as ex:
+                print(f"[{ts()}] [CRUISE] all sailings retry failed: {ex!r}", flush=True)
+                reply = "查詢全部航程失敗，請稍後再試"
+                cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+                return
+        except Exception as ex:
+            print(f"[{ts()}] [CRUISE] all sailings failed: {ex!r}", flush=True)
+            reply = "查詢全部航程失敗，請稍後再試"
+            cruise_line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
+
+        if not sailings:
+            cruise_line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=format_all_cruise_sailings(sailings)),
+            )
+            return
+        _send_line_message_batches(
+            cruise_line_bot_api,
+            build_all_cruise_flex_messages(sailings),
+            event.reply_token,
+            user_id,
+        )
+        return
     if raw_text.startswith(("訂房", "订房")):
         if not is_cruise_daemon_enabled():
             reply = "訂房功能目前未啟用"
@@ -4893,6 +5383,7 @@ def handle_cruise_message(event):
             "刪除/del YYYY-MM-DD\n"
             "緊急聯絡人 / 親友名單\n"
             "積分 / 客房積分 / 獎勵積分 / 等級積分\n"
+            "全部航程（列出今天以後所有航次）\n"
             "訂房完整格式如：訂房 2026/02/22 海景房 周惠X 李X樂 李X貴 李X昇\n"
             "若收到客房積分提示，回覆：是 / 否\n"
             "全部指令日期支援 YYYY-MM-DD / YYYYMMDD / YYYY/MM/DD / YYYY.MM.DD\n"
