@@ -1,5 +1,6 @@
 // ==UserScript==
 // @name         SDC Token Sync (after manual login) - fetch+XHR
+// @version      2026.08.30.1
 // @match        *://sdr.stardreamcruises.com/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -7,7 +8,15 @@
 // ==/UserScript==
 
 (function () {
-  console.log("[SDC] TokenSync script loaded on", location.href);
+  const SCRIPT_VERSION = "2026.08.30.1";
+  const LOADED_KEY = "__sdcTokenSyncLoadedVersion";
+  if (window[LOADED_KEY]) {
+    console.log("[SDC] TokenSync already loaded version=", window[LOADED_KEY]);
+    return;
+  }
+  window[LOADED_KEY] = SCRIPT_VERSION;
+
+  console.log("[SDC] TokenSync script loaded version=", SCRIPT_VERSION, "on", location.href);
   const PUSH_URL = "http://127.0.0.1:5000/cruise/tokens";
   const TARGET = "/auth/customer/login";
 
@@ -18,7 +27,16 @@
       method: "POST",
       url: PUSH_URL,
       headers: { "Content-Type": "application/json" },
-      data: JSON.stringify({ accessToken, refreshToken, user, at: new Date().toISOString() }),
+      data: JSON.stringify({
+        accessToken,
+        refreshToken,
+        user,
+        at: new Date().toISOString(),
+        source: "browser_token_sync",
+        script_version: SCRIPT_VERSION,
+        page_url: location.href,
+        visibility: document.visibilityState,
+      }),
       timeout: 8000,
       onload: (res) => log("tokens push status=", res.status),
       onerror: (e) => log("tokens push error", e),

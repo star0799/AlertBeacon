@@ -61,6 +61,29 @@ echo COSTCO=%COSTCO% CRUISE_DAEMON=%CRUISE_DAEMON% BOT_SERVER=%BOT_SERVER% NGROK
 echo PY=%PY%
 echo.
 
+rem --- stop only processes launched from this AlertBeacon project ---
+set "STOP_SCRIPT=%ROOT%scripts\stop_alertbeacon_processes.ps1"
+if not exist "%STOP_SCRIPT%" (
+  echo [ERR] Restart helper not found: "%STOP_SCRIPT%"
+  pause
+  exit /b 1
+)
+
+echo [RESTART] Stopping existing AlertBeacon services...
+set "ALERTBEACON_RESTART_ROOT=%ROOT%"
+set "ALERTBEACON_RESTART_PYTHON=%PY%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%STOP_SCRIPT%"
+if errorlevel 1 (
+  echo [ERR] Existing services could not be stopped safely. New services were not started.
+  pause
+  exit /b 1
+)
+
+set "RESTART_EPOCH=0"
+for /f %%T in ('powershell -NoProfile -Command "[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()"') do set "RESTART_EPOCH=%%T"
+echo [RESTART] Existing AlertBeacon services stopped.
+echo.
+
 if "%BOT_SERVER%"=="1" set "START_BOT=1"
 
 if "%START_BOT%"=="1" (
@@ -90,6 +113,26 @@ if exist "%ROOT%watchdog_daemon.py" (
 )
 
 echo.
-echo Done. Check logs\*.log if something didn't start.
-pause
+echo [VERIFY] Waiting for restarted services...
+set "VERIFY_FAILED=0"
+
+if "%START_BOT%"=="1" (
+  powershell -NoProfile -Command "$deadline=(Get-Date).AddSeconds(25); $ok=$false; do { try { $h=Invoke-RestMethod -Uri 'http://127.0.0.1:5000/health' -TimeoutSec 2; if ($h.ok -eq $true -and $h.service -eq 'bot_server') { $ok=$true; break } } catch {}; Start-Sleep -Milliseconds 500 } while ((Get-Date) -lt $deadline); if ($ok) { Write-Host ('[OK] bot_server pid=' + $h.pid); exit 0 }; Write-Host '[WARN] bot_server health check failed'; exit 1"
+  if errorlevel 1 set "VERIFY_FAILED=1"
+)
+
+if "%CRUISE_DAEMON%"=="1" (
+  powershell -NoProfile -Command "$deadline=(Get-Date).AddSeconds(25); $ok=$false; do { try { $hb=Get-Content -LiteralPath '%ROOT%state\heartbeat_cruise_daemon.json' -Raw | ConvertFrom-Json; if ($hb.status -eq 'running' -and [double]$hb.ts -ge [double]%RESTART_EPOCH%) { $ok=$true; break } } catch {}; Start-Sleep -Milliseconds 500 } while ((Get-Date) -lt $deadline); if ($ok) { Write-Host ('[OK] cruise_daemon heartbeat=' + $hb.ts_str); exit 0 }; Write-Host '[WARN] cruise_daemon heartbeat check failed'; exit 1"
+  if errorlevel 1 set "VERIFY_FAILED=1"
+)
+
+echo.
+if "%VERIFY_FAILED%"=="1" (
+  echo Restart completed with verification warnings. Check the service windows.
+  powershell -NoProfile -Command "Start-Sleep -Seconds 3"
+  exit /b 1
+)
+
+echo Restart complete. Check the service windows for details.
+powershell -NoProfile -Command "Start-Sleep -Seconds 3"
 exit /b 0

@@ -3,6 +3,8 @@ from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError, LineBotApiError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from flask import Flask, request, jsonify
+import base64
+import hashlib
 import html
 import re
 import os
@@ -23,6 +25,10 @@ PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip()
 
 app = Flask(__name__)
 app.json.ensure_ascii = False
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SDC_TOKEN_SYNC_SCRIPT_FILE = os.path.join(BASE_DIR, "scripts", "sdc_token_sync.user.js")
+SDC_TOKEN_SYNC_LOADER_FILE = os.path.join(BASE_DIR, "scripts", "sdc_token_sync_loader.user.js")
 
 PAYMENT_FOR_PORT_CHARGE = "Port Charge"
 PAYMENT_FOR_NON_MEMBER_SURCHARGE = "Non Member Surcharge"
@@ -56,6 +62,34 @@ PAYMENT_FOR_ALIASES = {
 def health():
     # Lightweight liveness probe for local watchdog.
     return jsonify({"ok": True, "service": "bot_server", "ts": time.time(), "pid": os.getpid()})
+
+
+def _serve_local_userscript(path: str):
+    if request.remote_addr not in {"127.0.0.1", "::1"}:
+        abort(403)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            script = f.read()
+    except OSError as exc:
+        print(f"[{ts()}] [SDC] userscript read failed path={path!r} error={exc!r}", flush=True)
+        abort(404)
+
+    response = app.response_class(script, mimetype="application/javascript")
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+
+
+@app.get("/cruise/sdc-token-sync.js")
+def sdc_token_sync_script():
+    return _serve_local_userscript(SDC_TOKEN_SYNC_SCRIPT_FILE)
+
+
+@app.get("/cruise/sdc-token-sync-loader.user.js")
+def sdc_token_sync_loader():
+    return _serve_local_userscript(SDC_TOKEN_SYNC_LOADER_FILE)
 
 
 @app.get("/_routes")
@@ -112,6 +146,7 @@ FEATURES_FILE = "features.json"
 CRUISE_MONITORS_FILE = "monitors_cruise.json"
 STATE_DIR = "state"
 os.makedirs(STATE_DIR, exist_ok=True)
+TOKEN_EVENTS_FILE = os.path.join(STATE_DIR, "token_events.jsonl")
 PAY_LINKS_FILE = os.path.join(STATE_DIR, "pay_links.json")
 PAY_LINKS_LOCK = os.path.join(STATE_DIR, "pay_links.json.lock")
 PENDING_RWCC_CONFIRM_FILE = os.path.join(STATE_DIR, "pending_rwcc_confirm.json")
@@ -140,6 +175,122 @@ CRUISE_AVAILABILITY_NOTIFY_TYPES = {
 }
 
 
+def _decode_jwt_claims(token: str | None) -> dict:
+    if not isinstance(token, str) or token.count(".") != 2:
+        return {}
+    try:
+        encoded = token.split(".")[1]
+        encoded += "=" * ((4 - len(encoded) % 4) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(encoded.encode("ascii")))
+        return claims if isinstance(claims, dict) else {}
+    except Exception:
+        return {}
+
+
+def _token_metadata(token: str | None) -> dict:
+    if not isinstance(token, str) or not token:
+        return {"present": False}
+    claims = _decode_jwt_claims(token)
+    now = int(time.time())
+    iat = claims.get("iat")
+    exp = claims.get("exp")
+    metadata = {
+        "present": True,
+        "fingerprint": hashlib.sha256(token.encode("utf-8")).hexdigest()[:12],
+        "iat": iat if isinstance(iat, (int, float)) else None,
+        "exp": exp if isinstance(exp, (int, float)) else None,
+        "sub": str(claims.get("sub")) if claims.get("sub") is not None else None,
+        "session": str(claims.get("session")) if claims.get("session") is not None else None,
+        "dpiHiFai": str(claims.get("dpiHiFai")) if claims.get("dpiHiFai") is not None else None,
+    }
+    if isinstance(iat, (int, float)) and isinstance(exp, (int, float)):
+        metadata["ttl_seconds"] = int(exp - iat)
+    if isinstance(exp, (int, float)):
+        metadata["expired"] = exp <= now
+        metadata["seconds_until_expiry"] = int(exp - now)
+    return metadata
+
+
+def _token_transition_metadata(previous_access: dict, previous_refresh: dict, received_access: dict, received_refresh: dict) -> dict:
+    previous_session = previous_access.get("session") or previous_refresh.get("session")
+    received_session = received_access.get("session") or received_refresh.get("session")
+    previous_sub = previous_access.get("sub") or previous_refresh.get("sub")
+    received_sub = received_access.get("sub") or received_refresh.get("sub")
+    return {
+        "previous_sub": previous_sub,
+        "received_sub": received_sub,
+        "same_sub": previous_sub == received_sub if previous_sub and received_sub else None,
+        "previous_session": previous_session,
+        "received_session": received_session,
+        "same_session": previous_session == received_session if previous_session and received_session else None,
+        "access_fingerprint_changed": previous_access.get("fingerprint") != received_access.get("fingerprint")
+        if previous_access.get("present") and received_access.get("present")
+        else None,
+        "refresh_fingerprint_changed": previous_refresh.get("fingerprint") != received_refresh.get("fingerprint")
+        if previous_refresh.get("present") and received_refresh.get("present")
+        else None,
+    }
+
+
+def _redact_token_event_value(value):
+    if isinstance(value, str):
+        return re.sub(
+            r"eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
+            "[REDACTED_JWT]",
+            value,
+        )
+    if isinstance(value, dict):
+        return {key: _redact_token_event_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_token_event_value(item) for item in value]
+    return value
+
+
+def _append_token_event(event: str, **fields) -> None:
+    payload = {
+        "ts": time.time(),
+        "ts_str": ts(),
+        "process": "bot_server",
+        "event": event,
+    }
+    payload.update(fields)
+    payload = _redact_token_event_value(payload)
+    try:
+        lock = FileLock(TOKEN_EVENTS_FILE + ".lock")
+        with lock:
+            with open(TOKEN_EVENTS_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception as ex:
+        print(f"[{ts()}] [CRUISE] token event write failed: {type(ex).__name__}: {ex}", flush=True)
+
+
+def _token_pair_rejection_reason(access_token: str, refresh_token: str) -> str | None:
+    now = int(time.time())
+    received_access = _token_metadata(access_token)
+    received_refresh = _token_metadata(refresh_token)
+    for label, metadata in (("access", received_access), ("refresh", received_refresh)):
+        exp = metadata.get("exp")
+        if isinstance(exp, (int, float)) and exp <= now:
+            return f"received_{label}_token_expired"
+
+    current_iats = [
+        value
+        for value in (
+            _token_metadata(_latest_tokens.get("accessToken")).get("iat"),
+            _token_metadata(_latest_tokens.get("refreshToken")).get("iat"),
+        )
+        if isinstance(value, (int, float))
+    ]
+    received_iats = [
+        value
+        for value in (received_access.get("iat"), received_refresh.get("iat"))
+        if isinstance(value, (int, float))
+    ]
+    if current_iats and received_iats and max(received_iats) < max(current_iats):
+        return "received_token_older_than_current"
+    return None
+
+
 def _resolve_cruise_notify_target(event_type: str) -> tuple[LineBotApi | None, str, str]:
     if event_type in CRUISE_AVAILABILITY_NOTIFY_TYPES:
         return cruise_line_bot_api, USERS_CRUISE_FILE, "cruise"
@@ -150,11 +301,56 @@ def _resolve_cruise_notify_target(event_type: str) -> tuple[LineBotApi | None, s
 @app.post("/cruise/tokens")
 def cruise_tokens():
     data = request.get_json(force=True, silent=True) or {}
-    if not data.get("accessToken") or not data.get("refreshToken"):
+    access_token = data.get("accessToken")
+    refresh_token = data.get("refreshToken")
+    source = str(data.get("source") or "external_token_sync")[:80]
+    source_detail = {
+        "at": data.get("at"),
+        "page_url": str(data.get("page_url") or "")[:200] or None,
+        "visibility": str(data.get("visibility") or "")[:40] or None,
+        "script_version": str(data.get("script_version") or "")[:40] or None,
+        "remote_addr": request.remote_addr,
+        "user_agent": str(request.headers.get("User-Agent") or "")[:200] or None,
+    }
+    if not access_token or not refresh_token:
+        _append_token_event(
+            "token_update_rejected",
+            source=source,
+            reason="missing_tokens",
+            source_detail=source_detail,
+        )
         return jsonify({"ok": False, "error": "missing tokens"}), 400
+
+    received_access_meta = _token_metadata(access_token)
+    received_refresh_meta = _token_metadata(refresh_token)
+    current_access_meta = _token_metadata(_latest_tokens.get("accessToken"))
+    current_refresh_meta = _token_metadata(_latest_tokens.get("refreshToken"))
+    rejection_reason = _token_pair_rejection_reason(access_token, refresh_token)
+    if rejection_reason:
+        _append_token_event(
+            "token_update_rejected",
+            source=source,
+            reason=rejection_reason,
+            source_detail=source_detail,
+            transition=_token_transition_metadata(
+                current_access_meta,
+                current_refresh_meta,
+                received_access_meta,
+                received_refresh_meta,
+            ),
+            received_access=received_access_meta,
+            received_refresh=received_refresh_meta,
+            current_access=current_access_meta,
+            current_refresh=current_refresh_meta,
+        )
+        print(f"[{ts()}] [CRUISE] token update rejected source={source} reason={rejection_reason}", flush=True)
+        return jsonify({"ok": False, "error": rejection_reason}), 409
+
     global CRUISE_RELOGIN_NEEDED, LAST_RECOVER_ALERT_AT
     was_missing = not (_latest_tokens.get("accessToken") and _latest_tokens.get("refreshToken"))
     prev_access = _latest_tokens.get("accessToken")
+    previous_access_meta = current_access_meta
+    previous_refresh_meta = current_refresh_meta
     user_val = data.get("user")
     customer_id = None
     if isinstance(user_val, dict):
@@ -167,14 +363,29 @@ def cruise_tokens():
     if prev_access != data.get("accessToken"):
         user_mmid = None
     _latest_tokens.update({
-        "accessToken": data["accessToken"],
-        "refreshToken": data["refreshToken"],
+        "accessToken": access_token,
+        "refreshToken": refresh_token,
         "user": user_val,
         "customer_id": customer_id,
         "user_mmid": user_mmid,
         "at": data.get("at"),
     })
     write_json_atomic(TOKENS_CACHE_FILE, _latest_tokens)
+    _append_token_event(
+        "token_update_accepted",
+        source=source,
+        source_detail=source_detail,
+        transition=_token_transition_metadata(
+            previous_access_meta,
+            previous_refresh_meta,
+            received_access_meta,
+            received_refresh_meta,
+        ),
+        previous_access=previous_access_meta,
+        previous_refresh=previous_refresh_meta,
+        received_access=received_access_meta,
+        received_refresh=received_refresh_meta,
+    )
     print(f"[{ts()}] [CRUISE] tokens updated", _latest_tokens["at"])
     should_notify = CRUISE_RELOGIN_NEEDED or was_missing
     if should_notify:
@@ -907,6 +1118,19 @@ def cruise_recaptcha_get():
 
 @app.post("/cruise/tokens/clear")
 def cruise_tokens_clear():
+    data = request.get_json(force=True, silent=True) or {}
+    previous_access_meta = _token_metadata(_latest_tokens.get("accessToken"))
+    previous_refresh_meta = _token_metadata(_latest_tokens.get("refreshToken"))
+    _append_token_event(
+        "tokens_cleared",
+        source=str(data.get("source") or "api")[:80],
+        reason=str(data.get("reason") or "requested")[:200],
+        detail=str(data.get("detail") or "")[:500],
+        previous_session=previous_access_meta.get("session") or previous_refresh_meta.get("session"),
+        previous_sub=previous_access_meta.get("sub") or previous_refresh_meta.get("sub"),
+        previous_access=previous_access_meta,
+        previous_refresh=previous_refresh_meta,
+    )
     _latest_tokens.update({
         "accessToken": None,
         "refreshToken": None,
@@ -1109,6 +1333,14 @@ def trigger_relogin(reason: str, detail: str = "") -> None:
             flush=True,
         )
 
+    _append_token_event(
+        "relogin_triggered",
+        source="bot_server",
+        reason=str(reason)[:200],
+        detail=str(detail)[:500],
+        previous_access=_token_metadata(_latest_tokens.get("accessToken")),
+        previous_refresh=_token_metadata(_latest_tokens.get("refreshToken")),
+    )
     _latest_tokens.update({
         "accessToken": None,
         "refreshToken": None,

@@ -1,5 +1,8 @@
+import base64
+import hashlib
 import json
 import os
+import re
 import time
 from datetime import datetime
 import requests
@@ -13,8 +16,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_DIR = os.path.join(BASE_DIR, "state")
 os.makedirs(STATE_DIR, exist_ok=True)
 HEARTBEAT_FILE = os.path.join(STATE_DIR, "heartbeat_cruise_daemon.json")
+TOKEN_EVENTS_FILE = os.path.join(STATE_DIR, "token_events.jsonl")
 HEARTBEAT_INTERVAL_SECONDS = 10
 _last_heartbeat_at = 0.0
+_last_cycle_started_at = 0.0
+_last_cycle_gap_seconds = 0.0
 MONITORS_FILE = os.path.join(BASE_DIR, "monitors_cruise.json")
 TIER_RULES_FILE = os.path.join(BASE_DIR, "cabin_name")
 FEATURES_FILE = os.path.join(BASE_DIR, "features.json")
@@ -35,6 +41,124 @@ STANDBY_CABIN_KEYWORDS = (
 
 def ts() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _decode_jwt_claims(token: str | None) -> dict:
+    if not isinstance(token, str) or token.count(".") != 2:
+        return {}
+    try:
+        encoded = token.split(".")[1]
+        encoded += "=" * ((4 - len(encoded) % 4) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(encoded.encode("ascii")))
+        return claims if isinstance(claims, dict) else {}
+    except Exception:
+        return {}
+
+
+def _token_metadata(token: str | None) -> dict:
+    if not isinstance(token, str) or not token:
+        return {"present": False}
+    claims = _decode_jwt_claims(token)
+    now = int(time.time())
+    iat = claims.get("iat")
+    exp = claims.get("exp")
+    metadata = {
+        "present": True,
+        "fingerprint": hashlib.sha256(token.encode("utf-8")).hexdigest()[:12],
+        "iat": iat if isinstance(iat, (int, float)) else None,
+        "exp": exp if isinstance(exp, (int, float)) else None,
+        "sub": str(claims.get("sub")) if claims.get("sub") is not None else None,
+        "session": str(claims.get("session")) if claims.get("session") is not None else None,
+        "dpiHiFai": str(claims.get("dpiHiFai")) if claims.get("dpiHiFai") is not None else None,
+    }
+    if isinstance(iat, (int, float)) and isinstance(exp, (int, float)):
+        metadata["ttl_seconds"] = int(exp - iat)
+    if isinstance(exp, (int, float)):
+        metadata["expired"] = exp <= now
+        metadata["seconds_until_expiry"] = int(exp - now)
+    return metadata
+
+
+def _token_transition_metadata(previous_access: dict, previous_refresh: dict, received_access: dict, received_refresh: dict) -> dict:
+    previous_session = previous_access.get("session") or previous_refresh.get("session")
+    received_session = received_access.get("session") or received_refresh.get("session")
+    previous_sub = previous_access.get("sub") or previous_refresh.get("sub")
+    received_sub = received_access.get("sub") or received_refresh.get("sub")
+    return {
+        "previous_sub": previous_sub,
+        "received_sub": received_sub,
+        "same_sub": previous_sub == received_sub if previous_sub and received_sub else None,
+        "previous_session": previous_session,
+        "received_session": received_session,
+        "same_session": previous_session == received_session if previous_session and received_session else None,
+        "access_fingerprint_changed": previous_access.get("fingerprint") != received_access.get("fingerprint")
+        if previous_access.get("present") and received_access.get("present")
+        else None,
+        "refresh_fingerprint_changed": previous_refresh.get("fingerprint") != received_refresh.get("fingerprint")
+        if previous_refresh.get("present") and received_refresh.get("present")
+        else None,
+    }
+
+
+def _api_error_summary(text: str) -> dict:
+    body = _body_head(text, 500)
+    summary = {"body": body}
+    try:
+        data = json.loads(text or "{}")
+    except Exception:
+        return summary
+    if isinstance(data, dict):
+        summary["message"] = data.get("message")
+        summary["code"] = data.get("code")
+        summary["statusCode"] = data.get("statusCode")
+        summary["httpStatus"] = data.get("httpStatus")
+    return summary
+
+
+def _classify_auth_failure(status: int, token: str | None, token_kind: str) -> str:
+    metadata = _token_metadata(token)
+    if metadata.get("expired"):
+        if token_kind == "refresh" and _last_cycle_gap_seconds >= 1800:
+            return "refresh_expired_after_long_cycle_gap"
+        return f"{token_kind}_expired"
+    if status == 401:
+        return f"{token_kind}_revoked_or_replaced_before_expiry"
+    if status == 403:
+        return f"{token_kind}_forbidden_or_security_policy"
+    return f"{token_kind}_authorization_failed"
+
+
+def _redact_token_event_value(value):
+    if isinstance(value, str):
+        return re.sub(
+            r"eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
+            "[REDACTED_JWT]",
+            value,
+        )
+    if isinstance(value, dict):
+        return {key: _redact_token_event_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_token_event_value(item) for item in value]
+    return value
+
+
+def _append_token_event(event: str, **fields) -> None:
+    payload = {
+        "ts": time.time(),
+        "ts_str": ts(),
+        "process": "monitor_cruise_daemon",
+        "event": event,
+        "cycle_gap_seconds": round(_last_cycle_gap_seconds, 3),
+    }
+    payload.update(fields)
+    payload = _redact_token_event_value(payload)
+    try:
+        lock = FileLock(TOKEN_EVENTS_FILE + ".lock")
+        with lock:
+            with open(TOKEN_EVENTS_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception as ex:
+        print(f"[{ts()}] [DAEMON] token event write failed: {type(ex).__name__}: {ex}", flush=True)
 
 
 class NotifyDeliveryFailed(Exception):
@@ -143,14 +267,41 @@ def check_bot_server_health() -> tuple[bool, str]:
 
 
 def refresh(refresh_token: str) -> dict:
-    r = requests.get(
-        f"{BASE}/auth/customer/refresh",
-        headers={"Authorization": f"Bearer {refresh_token}"},
-        timeout=20,
-    )
+    try:
+        r = requests.get(
+            f"{BASE}/auth/customer/refresh",
+            headers={"Authorization": f"Bearer {refresh_token}"},
+            timeout=20,
+        )
+    except requests.RequestException as ex:
+        _append_token_event(
+            "refresh_request_failed",
+            error_type=type(ex).__name__,
+            detail=str(ex)[:500],
+            refresh=_token_metadata(refresh_token),
+        )
+        raise
     if r.status_code in (401, 403):
-        body = (r.text or "")[:200].replace("\n", " ").replace("\r", " ")
+        body = _body_head(r.text or "")
+        refresh_meta = _token_metadata(refresh_token)
+        _append_token_event(
+            "refresh_unauthorized",
+            status=r.status_code,
+            classification=_classify_auth_failure(r.status_code, refresh_token, "refresh"),
+            detail=body,
+            api_error=_api_error_summary(r.text or ""),
+            token_session=refresh_meta.get("session"),
+            token_sub=refresh_meta.get("sub"),
+            refresh=refresh_meta,
+        )
         raise PermissionError(f"refresh unauthorized {r.status_code} body={body}")
+    if r.status_code >= 400:
+        _append_token_event(
+            "refresh_http_failed",
+            status=r.status_code,
+            detail=(r.text or "")[:500].replace("\n", " ").replace("\r", " "),
+            refresh=_token_metadata(refresh_token),
+        )
     r.raise_for_status()
     return r.json()
 
@@ -189,7 +340,20 @@ def cabin_allotment(access_token: str, params: dict) -> tuple[int, dict]:
         timeout=20,
     )
     if r.status_code in (401, 403):
-        raise PermissionError(f"cabin unauthorized {r.status_code}")
+        body = _body_head(r.text or "", 500)
+        access_meta = _token_metadata(access_token)
+        _append_token_event(
+            "cabin_unauthorized",
+            status=r.status_code,
+            classification=_classify_auth_failure(r.status_code, access_token, "access"),
+            detail=body,
+            api_error=_api_error_summary(r.text or ""),
+            token_session=access_meta.get("session"),
+            token_sub=access_meta.get("sub"),
+            request_params=params,
+            access=access_meta,
+        )
+        raise PermissionError(f"cabin unauthorized {r.status_code} body={body[:200]}")
     r.raise_for_status()
     return r.status_code, r.json()
 
@@ -469,16 +633,56 @@ def fetch_cabins(access: str, refresh_token: str, params: dict, user: str | None
         new_refresh = ref.get("refreshToken")
 
         if new_access or new_refresh:
+            previous_access_meta = _token_metadata(access)
+            previous_refresh_meta = _token_metadata(refresh_token)
+            received_access_meta = _token_metadata(new_access or access)
+            received_refresh_meta = _token_metadata(new_refresh or refresh_token)
+            _append_token_event(
+                "refresh_succeeded",
+                source="daemon_refresh",
+                transition=_token_transition_metadata(
+                    previous_access_meta,
+                    previous_refresh_meta,
+                    received_access_meta,
+                    received_refresh_meta,
+                ),
+                previous_access=previous_access_meta,
+                previous_refresh=previous_refresh_meta,
+                received_access=received_access_meta,
+                received_refresh=received_refresh_meta,
+            )
             payload = {
                 "accessToken": new_access or access,
                 "refreshToken": new_refresh or refresh_token,
                 "user": user,
                 "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "source": "daemon_refresh",
             }
             try:
-                requests.post(f"{BOT}/cruise/tokens", json=payload, timeout=5)
+                sync_response = requests.post(f"{BOT}/cruise/tokens", json=payload, timeout=5)
+                if not sync_response.ok:
+                    _append_token_event(
+                        "token_update_post_rejected",
+                        status=sync_response.status_code,
+                        detail=(sync_response.text or "")[:500],
+                        access=_token_metadata(payload["accessToken"]),
+                        refresh=_token_metadata(payload["refreshToken"]),
+                    )
+                    if sync_response.status_code == 409:
+                        latest_tokens, latest_state, _ = get_tokens()
+                        if latest_state == "ok" and latest_tokens:
+                            payload["accessToken"] = latest_tokens.get("accessToken") or payload["accessToken"]
+                            payload["refreshToken"] = latest_tokens.get("refreshToken") or payload["refreshToken"]
+                            payload["user"] = latest_tokens.get("user") or payload["user"]
             except Exception as ex:
                 print(f"[{ts()}] [DAEMON] warn: failed to POST /cruise/tokens:", repr(ex), flush=True)
+                _append_token_event(
+                    "token_update_post_failed",
+                    error_type=type(ex).__name__,
+                    detail=str(ex)[:500],
+                    access=_token_metadata(payload["accessToken"]),
+                    refresh=_token_metadata(payload["refreshToken"]),
+                )
 
             access = payload["accessToken"]
             refresh_token = payload["refreshToken"]
@@ -488,6 +692,7 @@ def fetch_cabins(access: str, refresh_token: str, params: dict, user: str | None
 
 
 def main():
+    global _last_cycle_started_at, _last_cycle_gap_seconds
     load_dotenv()
 
     print(f"[{ts()}] [DAEMON] started. polling every {POLL_SECONDS} seconds", flush=True)
@@ -499,6 +704,10 @@ def main():
     tier_rules = load_tier_rules()
 
     while True:
+        cycle_started_at = time.time()
+        if _last_cycle_started_at > 0:
+            _last_cycle_gap_seconds = cycle_started_at - _last_cycle_started_at
+        _last_cycle_started_at = cycle_started_at
         if not feature_enabled("cruise_daemon"):
             if not paused:
                 print(f"[{ts()}] ⏸️ Cruise 監控已停用，暫停檢查中", flush=True)
@@ -760,7 +969,15 @@ def main():
                             print(f"[{ts()}] [DAEMON] notify failed:", repr(ex), flush=True)
                         relogin_notified = True
                     try:
-                        requests.post(f"{BOT}/cruise/tokens/clear", timeout=5)
+                        requests.post(
+                            f"{BOT}/cruise/tokens/clear",
+                            json={
+                                "source": "monitor_cruise_daemon",
+                                "reason": "refresh_unauthorized",
+                                "detail": err_text[:500],
+                            },
+                            timeout=5,
+                        )
                         print(f"[{ts()}] [DAEMON] tokens cleared on bot_server", flush=True)
                     except Exception as ex:
                         print(f"[{ts()}] [DAEMON] warn: failed to clear tokens:", repr(ex), flush=True)
